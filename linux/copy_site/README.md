@@ -53,7 +53,7 @@
 
 1. Скачайте скрипт:
 ```bash
-wget https://your-repo/copy_site.sh
+wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
 chmod +x copy_site.sh
 ```
 

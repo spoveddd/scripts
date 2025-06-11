@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# FastPanel Site Copy Script
-# Автор: Техподдержка FastPanel
-# Версия: 2.0
+# Site Copy Script
+# Автор: Vladislav Pavlovich
+# Версия: 2.1
+# Поддерживает: FastPanel, ISPManager
 
 set -e
 
@@ -16,6 +17,7 @@ NC='\033[0m' # No Color
 # Глобальные переменные
 LOG_FILE="/var/log/fastpanel_site_copy_$(date +%Y%m%d_%H%M%S).log"
 TEMP_DUMP_FILE=""
+CONTROL_PANEL=""
 
 # Функция для вывода сообщений с логированием
 log_info() {
@@ -157,47 +159,186 @@ detect_cms() {
     echo "unknown"
 }
 
-# Функция для поиска директории сайта
+# Функция для определения панели управления
+detect_control_panel() {
+    log_info "Определяем тип панели управления..."
+    
+    # Проверяем наличие ISPManager по сервису ihttpd
+    if systemctl is-active --quiet ihttpd.service 2>/dev/null || systemctl list-units --type=service | grep -q ihttpd.service; then
+        CONTROL_PANEL="ispmanager"
+        log_success "Обнаружена панель: ISPManager"
+        return 0
+    fi
+    
+    # Проверяем наличие FastPanel по характерным директориям
+    if [[ -d "/usr/local/mgr5" ]] || [[ -d "/usr/local/fastpanel" ]]; then
+        CONTROL_PANEL="fastpanel"
+        log_success "Обнаружена панель: FastPanel"
+        return 0
+    fi
+    
+    # Дополнительная проверка по структуре директорий
+    if find /var/www -maxdepth 2 -type d -name "data" 2>/dev/null | head -1 | grep -q "/var/www/.*/data"; then
+        # Если есть структура /var/www/*/data, скорее всего FastPanel или ISPManager
+        # Проверяем есть ли www-root (характерно для ISPManager)
+        if [[ -d "/var/www/www-root" ]]; then
+            CONTROL_PANEL="ispmanager"
+            log_success "Обнаружена панель: ISPManager (по структуре директорий)"
+        else
+            CONTROL_PANEL="fastpanel"
+            log_success "Обнаружена панель: FastPanel (по структуре директорий)"
+        fi
+        return 0
+    fi
+    
+    # Если ничего не найдено, по умолчанию FastPanel
+    CONTROL_PANEL="fastpanel"
+    log_warning "Не удалось определить панель управления, используем FastPanel по умолчанию"
+}
+
+# Функция для поиска директории сайта (обновленная)
 find_site_directory() {
     local site_name="$1"
     local found_path=""
     
-    # Поиск по стандартному пути FastPanel
-    for user_dir in /var/www/*/; do
-        if [[ -d "${user_dir}data/www/${site_name}" ]]; then
-            found_path="${user_dir}data/www/${site_name}"
-            break
-        fi
-    done
+    log_info "Ищем директорию сайта $site_name для панели $CONTROL_PANEL..."
+    
+    case $CONTROL_PANEL in
+        "ispmanager")
+            # Для ISPManager сайты обычно в /var/www/www-root/data/www/
+            if [[ -d "/var/www/www-root/data/www/${site_name}" ]]; then
+                found_path="/var/www/www-root/data/www/${site_name}"
+                log_success "Найден сайт ISPManager: $found_path"
+            else
+                # Дополнительный поиск по всем пользователям (на случай если есть другие)
+                for user_dir in /var/www/*/; do
+                    if [[ -d "${user_dir}data/www/${site_name}" ]]; then
+                        found_path="${user_dir}data/www/${site_name}"
+                        log_success "Найден сайт ISPManager (альтернативный путь): $found_path"
+                        break
+                    fi
+                done
+            fi
+            ;;
+        "fastpanel")
+            # Для FastPanel поиск по стандартному пути
+            for user_dir in /var/www/*/; do
+                if [[ -d "${user_dir}data/www/${site_name}" ]]; then
+                    found_path="${user_dir}data/www/${site_name}"
+                    log_success "Найден сайт FastPanel: $found_path"
+                    break
+                fi
+            done
+            ;;
+    esac
     
     echo "$found_path"
 }
 
-# Функция для получения владельца сайта из пути
+# Функция для получения владельца сайта из пути (обновленная)
 get_site_owner() {
     local site_path="$1"
-    # Извлекаем имя пользователя из пути /var/www/username/data/www/site
-    echo "$site_path" | sed -n 's|/var/www/\([^/]*\)/.*|\1|p'
+    local owner=""
+    
+    case $CONTROL_PANEL in
+        "ispmanager")
+            # Для ISPManager обычно www-root
+            owner=$(echo "$site_path" | sed -n 's|/var/www/\([^/]*\)/.*|\1|p')
+            # Если не удалось извлечь, по умолчанию www-root
+            if [[ -z "$owner" ]]; then
+                owner="www-root"
+            fi
+            ;;
+        "fastpanel")
+            # Для FastPanel извлекаем из пути
+            owner=$(echo "$site_path" | sed -n 's|/var/www/\([^/]*\)/.*|\1|p')
+            ;;
+    esac
+    
+    echo "$owner"
+}
+
+# Функция для предложения владельца нового сайта
+suggest_site_owner() {
+    local source_site_path="$1"
+    local new_site_name="$2"
+    local suggested_owner=""
+    
+    case $CONTROL_PANEL in
+        "ispmanager")
+            # Для ISPManager проверяем, есть ли уже директория для нового сайта
+            if [[ -d "/var/www/www-root/data/www/${new_site_name}" ]]; then
+                suggested_owner="www-root"
+                log_info "Найдена существующая директория для сайта $new_site_name, владелец: www-root"
+            else
+                # По умолчанию www-root для ISPManager
+                suggested_owner="www-root"
+                log_info "Для ISPManager предлагаем владельца: www-root"
+            fi
+            ;;
+        "fastpanel")
+            # Для FastPanel используем логику как раньше
+            local source_owner=$(get_site_owner "$source_site_path")
+            suggested_owner="${new_site_name}_usr"
+            log_info "Для FastPanel предлагаем владельца: $suggested_owner"
+            ;;
+    esac
+    
+    echo "$suggested_owner"
+}
+
+# Функция для проверки и создания структуры директорий
+ensure_site_directory_structure() {
+    local site_owner="$1"
+    local site_name="$2"
+    
+    case $CONTROL_PANEL in
+        "ispmanager")
+            local base_dir="/var/www/${site_owner}/data/www"
+            ;;
+        "fastpanel")
+            local base_dir="/var/www/${site_owner}/data/www"
+            ;;
+    esac
+    
+    # Проверяем существование базовой структуры
+    if [[ ! -d "$base_dir" ]]; then
+        case $CONTROL_PANEL in
+            "ispmanager")
+                log_error "Директория $base_dir не существует!"
+                log_error "Для ISPManager убедитесь что пользователь www-root создан"
+                return 1
+                ;;
+            "fastpanel")
+                log_error "Директория пользователя $base_dir не существует!"
+                log_error "Создайте пользователя $site_owner в FastPanel"
+                return 1
+                ;;
+        esac
+    fi
+    
+    log_success "Структура директорий для $CONTROL_PANEL корректна"
+    return 0
 }
 
 # Функция для извлечения данных БД из WordPress конфига
 get_db_info_from_wp_config() {
     local config_file="$1"
     if [[ -f "$config_file" ]]; then
-        # Пробуем извлечь данные с учетом пробелов в формате define( 'DB_NAME', 'value' );
-        local db_name=$(grep "DB_NAME" "$config_file" | sed "s/.*define( 'DB_NAME', '\([^']*\)' );.*/\1/" | head -1)
-        local db_user=$(grep "DB_USER" "$config_file" | sed "s/.*define( 'DB_USER', '\([^']*\)' );.*/\1/" | head -1)
-        local db_pass=$(grep "DB_PASSWORD" "$config_file" | sed "s/.*define( 'DB_PASSWORD', '\([^']*\)' );.*/\1/" | head -1)
+        # Извлекаем значения из строк вида define('DB_NAME', 'value');
+        local db_name=$(grep "DB_NAME" "$config_file" | grep -o "'[^']*'" | tail -1 | tr -d "'")
+        local db_user=$(grep "DB_USER" "$config_file" | grep -o "'[^']*'" | tail -1 | tr -d "'")
+        local db_pass=$(grep "DB_PASSWORD" "$config_file" | grep -o "'[^']*'" | tail -1 | tr -d "'")
         
-        # Если не получилось, пробуем формат без пробелов define('DB_NAME', 'value')
+        # Если не получилось с одинарными кавычками, пробуем двойные
         if [[ -z "$db_name" ]]; then
-            db_name=$(grep "DB_NAME" "$config_file" | sed "s/.*define('DB_NAME', '\([^']*\)').*/\1/" | head -1)
+            db_name=$(grep "DB_NAME" "$config_file" | grep -o '"[^"]*"' | tail -1 | tr -d '"')
         fi
         if [[ -z "$db_user" ]]; then
-            db_user=$(grep "DB_USER" "$config_file" | sed "s/.*define('DB_USER', '\([^']*\)').*/\1/" | head -1)
+            db_user=$(grep "DB_USER" "$config_file" | grep -o '"[^"]*"' | tail -1 | tr -d '"')
         fi
         if [[ -z "$db_pass" ]]; then
-            db_pass=$(grep "DB_PASSWORD" "$config_file" | sed "s/.*define('DB_PASSWORD', '\([^']*\)').*/\1/" | head -1)
+            db_pass=$(grep "DB_PASSWORD" "$config_file" | grep -o '"[^"]*"' | tail -1 | tr -d '"')
         fi
         
         echo "$db_name|$db_user|$db_pass"
@@ -621,7 +762,7 @@ test_dle_config_update() {
 # Основная функция
 main() {
     echo "=============================================="
-    echo "  FastPanel Site Copy Script v2.0"
+    echo "  Site Copy Script v2.1"
     echo "=============================================="
     echo
     
@@ -630,6 +771,9 @@ main() {
     
     check_root
     check_mysql_connection
+    
+    # Определяем панель управления
+    detect_control_panel
     
     # Шаг 1: Получаем информацию об исходном сайте
     echo -e "${BLUE}Шаг 1: Определение исходного сайта${NC}"
@@ -692,21 +836,39 @@ main() {
     echo
     echo -e "${BLUE}Шаг 2: Настройка нового сайта${NC}"
     read -p "Введите имя нового сайта (например, copy.local): " new_site_name
-    read -p "Введите имя пользователя нового сайта (например, copy_local_usr): " new_site_user
     
-    if [[ -z "$new_site_name" ]] || [[ -z "$new_site_user" ]]; then
-        log_error "Имя сайта и пользователя не могут быть пустыми!"
+    if [[ -z "$new_site_name" ]]; then
+        log_error "Имя сайта не может быть пустым!"
         exit 1
     fi
     
     validate_site_name "$new_site_name"
     
+    # Предлагаем владельца в зависимости от панели управления
+    suggested_owner=$(suggest_site_owner "$source_site_path" "$new_site_name")
+    
+    case $CONTROL_PANEL in
+        "ispmanager")
+            echo "Для ISPManager обычно используется пользователь www-root"
+            read -p "Введите имя пользователя нового сайта (по умолчанию: $suggested_owner): " new_site_user
+            ;;
+        "fastpanel")
+            read -p "Введите имя пользователя нового сайта (по умолчанию: $suggested_owner): " new_site_user
+            ;;
+    esac
+    
+    # Если пользователь ничего не ввел, используем предложенное значение
+    if [[ -z "$new_site_user" ]]; then
+        new_site_user="$suggested_owner"
+        log_info "Используем владельца по умолчанию: $new_site_user"
+    fi
+    
     # Формируем путь к новому сайту
     new_site_path="/var/www/${new_site_user}/data/www/${new_site_name}"
     
-    # Проверяем существование директории пользователя
-    if [[ ! -d "/var/www/${new_site_user}/data/www" ]]; then
-        log_error "Директория пользователя /var/www/${new_site_user}/data/www не существует!"
+    # Проверяем структуру директорий
+    ensure_site_directory_structure "$new_site_user" "$new_site_name"
+    if [[ $? -ne 0 ]]; then
         exit 1
     fi
     
@@ -725,16 +887,14 @@ main() {
     if [[ "$detected_cms" != "other" ]] && [[ -n "$old_db_name" ]]; then
         echo
         echo -e "${BLUE}Шаг 3: Настройка базы данных${NC}"
-        read -p "Введите имя новой базы данных [$old_db_name]: " new_db_name
-        new_db_name=${new_db_name:-$old_db_name}
+        read -p "Введите имя новой базы данных: " new_db_name
         
-        read -p "Введите имя пользователя БД [$old_db_user]: " new_db_user
-        new_db_user=${new_db_user:-$old_db_user}
+        read -p "Введите имя пользователя БД: " new_db_user
         
         read -p "Введите пароль для БД: " new_db_pass
         
-        if [[ -z "$new_db_pass" ]]; then
-            log_error "Пароль БД не может быть пустым!"
+        if [[ -z "$new_db_name" ]] || [[ -z "$new_db_user" ]] || [[ -z "$new_db_pass" ]]; then
+            log_error "Все поля базы данных должны быть заполнены!"
             exit 1
         fi
         
@@ -819,6 +979,7 @@ main() {
     echo "=============================================="
     log_success "Копирование сайта завершено успешно!"
     echo "=============================================="
+    echo "Панель управления: $CONTROL_PANEL"
     echo "Исходный сайт: $source_site_name"
     echo "Новый сайт: $new_site_name"
     echo "Путь: $new_site_path"
@@ -837,14 +998,32 @@ main() {
     
     if [[ "$detected_cms" != "other" ]]; then
         log_info "Не забудьте:"
-        echo "1. Настроить веб-сервер для нового сайта"
-        echo "2. Проверить работу сайта"
-        echo "3. При необходимости обновить дополнительные настройки"
+        case $CONTROL_PANEL in
+            "ispmanager")
+                echo "1. Настроить веб-сервер для нового сайта в ISPManager"
+                echo "2. Проверить работу сайта"
+                echo "3. При необходимости обновить дополнительные настройки"
+                ;;
+            "fastpanel")
+                echo "1. Настроить веб-сервер для нового сайта в FastPanel"
+                echo "2. Проверить работу сайта"
+                echo "3. При необходимости обновить дополнительные настройки"
+                ;;
+        esac
     else
         log_info "Не забудьте:"
-        echo "1. Создать и настроить базу данных (если требуется)"
-        echo "2. Обновить конфигурационные файлы"
-        echo "3. Настроить веб-сервер для нового сайта"
+        case $CONTROL_PANEL in
+            "ispmanager")
+                echo "1. Создать и настроить базу данных в ISPManager (если требуется)"
+                echo "2. Обновить конфигурационные файлы"
+                echo "3. Настроить веб-сервер для нового сайта"
+                ;;
+            "fastpanel")
+                echo "1. Создать и настроить базу данных в FastPanel (если требуется)"
+                echo "2. Обновить конфигурационные файлы"
+                echo "3. Настроить веб-сервер для нового сайта"
+                ;;
+        esac
     fi
 }
 

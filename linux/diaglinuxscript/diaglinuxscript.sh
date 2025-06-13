@@ -1,11 +1,7 @@
 #!/bin/bash
-# Developed by Victor A Simon
-# simon-project
-# Just for fun
+# Vladislav Pavlovich
+# v 1.0.0
 
-# Убираем проблемные локали
-# export LANG=ru_RU.UTF-8
-# export LC_TIME=ru_RU.UTF-8
 
 # Color
 RED='\033[1;31m'
@@ -1327,5 +1323,10 @@ done
 
 analyze_log "TESTLOG" "tail -${tail_small_depth} tests/testlog"
 echo -e "${DARK_GREEN}Готово.${NC}"
+
+# Красивое завершение
+echo -e "\n${DARK_GRAY}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}Создано Vladislav Pavlovich для технической поддержки${NC}"
+echo -e "${DARK_GRAY}═══════════════════════════════════════════════════════════════${NC}\n"
 
 #esdfulldwnldok

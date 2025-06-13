@@ -56,6 +56,20 @@
   - `sed`, `grep`, `find`
   - `systemctl` (для определения панели управления)
 
+### Скачивание и запуск
+
+#### Способ 1: Скачать и запустить (рекомендуется)
+```bash
+wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
+chmod +x copy_site.sh
+./copy_site.sh
+```
+
+#### Способ 2: Скачать и запустить одной командой
+```bash
+wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh -O copy_site.sh && chmod +x copy_site.sh && ./copy_site.sh
+```
+
 ## Установка
 
 1. Скачайте скрипт:
@@ -63,18 +77,7 @@
 wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
 chmod +x copy_site.sh
 ```
-
-2. Убедитесь что у вас есть права root:
-```bash
-sudo ./copy_site.sh
-```
-
-## Использование
-
-### Интерактивный режим
-
-Запустите скрипт без параметров для пошагового процесса:
-
+2. Запустите скрипт:
 ```bash
 sudo ./copy_site.sh
 ```

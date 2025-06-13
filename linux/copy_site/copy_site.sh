@@ -1,9 +1,8 @@
 #!/bin/bash
-
 # Site Copy Script
 # Автор: Vladislav Pavlovich
-# Версия: 2.1
-# Поддерживает: FastPanel, ISPManager
+# Версия: 2.2
+# Поддерживает: FastPanel, ISPManager, Hestia
 
 set -e
 
@@ -15,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Глобальные переменные
-LOG_FILE="/var/log/fastpanel_site_copy_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="/var/log/site_copy_script_$(date +%Y%m%d_%H%M%S).log"
 TEMP_DUMP_FILE=""
 CONTROL_PANEL=""
 
@@ -163,6 +162,13 @@ detect_cms() {
 detect_control_panel() {
     log_info "Определяем тип панели управления..."
     
+    # Проверяем наличие Hestia по сервисам
+    if systemctl is-active --quiet hestia.service 2>/dev/null || systemctl list-units --type=service | grep -q hestia.service; then
+        CONTROL_PANEL="hestia"
+        log_success "Обнаружена панель: Hestia"
+        return 0
+    fi
+    
     # Проверяем наличие ISPManager по сервису ihttpd
     if systemctl is-active --quiet ihttpd.service 2>/dev/null || systemctl list-units --type=service | grep -q ihttpd.service; then
         CONTROL_PANEL="ispmanager"
@@ -191,6 +197,13 @@ detect_control_panel() {
         return 0
     fi
     
+    # Проверяем структуру Hestia по директориям
+    if find /home -maxdepth 3 -type d -name "public_html" 2>/dev/null | head -1 | grep -q "/home/.*/web/.*/public_html"; then
+        CONTROL_PANEL="hestia"
+        log_success "Обнаружена панель: Hestia (по структуре директорий)"
+        return 0
+    fi
+    
     # Если ничего не найдено, по умолчанию FastPanel
     CONTROL_PANEL="fastpanel"
     log_warning "Не удалось определить панель управления, используем FastPanel по умолчанию"
@@ -204,6 +217,16 @@ find_site_directory() {
     log_info "Ищем директорию сайта $site_name для панели $CONTROL_PANEL..."
     
     case $CONTROL_PANEL in
+        "hestia")
+            # Для Hestia сайты в /home/пользователь/web/сайт/public_html/
+            for user_dir in /home/*/; do
+                if [[ -d "${user_dir}web/${site_name}/public_html" ]]; then
+                    found_path="${user_dir}web/${site_name}/public_html"
+                    log_success "Найден сайт Hestia: $found_path"
+                    break
+                fi
+            done
+            ;;
         "ispmanager")
             # Для ISPManager сайты обычно в /var/www/www-root/data/www/
             if [[ -d "/var/www/www-root/data/www/${site_name}" ]]; then
@@ -241,6 +264,10 @@ get_site_owner() {
     local owner=""
     
     case $CONTROL_PANEL in
+        "hestia")
+            # Для Hestia извлекаем пользователя из пути /home/пользователь/web/сайт/public_html
+            owner=$(echo "$site_path" | sed -n 's|/home/\([^/]*\)/.*|\1|p')
+            ;;
         "ispmanager")
             # Для ISPManager обычно www-root
             owner=$(echo "$site_path" | sed -n 's|/var/www/\([^/]*\)/.*|\1|p')
@@ -265,6 +292,12 @@ suggest_site_owner() {
     local suggested_owner=""
     
     case $CONTROL_PANEL in
+        "hestia")
+            # Для Hestia используем владельца исходного сайта
+            local source_owner=$(get_site_owner "$source_site_path")
+            suggested_owner="$source_owner"
+            log_info "Для Hestia предлагаем владельца: $suggested_owner"
+            ;;
         "ispmanager")
             # Для ISPManager проверяем, есть ли уже директория для нового сайта
             if [[ -d "/var/www/www-root/data/www/${new_site_name}" ]]; then
@@ -293,6 +326,9 @@ ensure_site_directory_structure() {
     local site_name="$2"
     
     case $CONTROL_PANEL in
+        "hestia")
+            local base_dir="/home/${site_owner}/web"
+            ;;
         "ispmanager")
             local base_dir="/var/www/${site_owner}/data/www"
             ;;
@@ -304,6 +340,11 @@ ensure_site_directory_structure() {
     # Проверяем существование базовой структуры
     if [[ ! -d "$base_dir" ]]; then
         case $CONTROL_PANEL in
+            "hestia")
+                log_error "Директория $base_dir не существует!"
+                log_error "Для Hestia убедитесь что пользователь $site_owner создан"
+                return 1
+                ;;
             "ispmanager")
                 log_error "Директория $base_dir не существует!"
                 log_error "Для ISPManager убедитесь что пользователь www-root создан"
@@ -580,15 +621,17 @@ update_wp_config() {
         log_info "Текущие настройки БД в конфиге:"
         grep -E "DB_NAME|DB_USER|DB_PASSWORD" "$config_file" >&2
         
-        # Обновляем настройки БД с учетом пробелов
-        sed -i "s/define( 'DB_NAME', '[^']*' );/define( 'DB_NAME', '$new_db_name' );/" "$config_file"
-        sed -i "s/define( 'DB_USER', '[^']*' );/define( 'DB_USER', '$new_db_user' );/" "$config_file"
-        sed -i "s/define( 'DB_PASSWORD', '[^']*' );/define( 'DB_PASSWORD', '$new_db_pass' );/" "$config_file"
+        # Создаем временный файл
+        local temp_file="${config_file}.tmp"
+        cp "$config_file" "$temp_file"
         
-        # Также обрабатываем формат без пробелов (на всякий случай)
-        sed -i "s/define('DB_NAME', '[^']*')/define('DB_NAME', '$new_db_name')/" "$config_file"
-        sed -i "s/define('DB_USER', '[^']*')/define('DB_USER', '$new_db_user')/" "$config_file"
-        sed -i "s/define('DB_PASSWORD', '[^']*')/define('DB_PASSWORD', '$new_db_pass')/" "$config_file"
+        # Обновляем каждую строку отдельно
+        sed -i "/DB_NAME/c\define( 'DB_NAME', '$new_db_name' );" "$temp_file"
+        sed -i "/DB_USER/c\define( 'DB_USER', '$new_db_user' );" "$temp_file"
+        sed -i "/DB_PASSWORD/c\define( 'DB_PASSWORD', '$new_db_pass' );" "$temp_file"
+        
+        # Заменяем оригинальный файл
+        mv "$temp_file" "$config_file"
         
         # Показываем обновленные настройки для проверки
         log_info "Обновленные настройки БД в конфиге:"
@@ -623,15 +666,18 @@ update_dle_config() {
         log_info "Текущие настройки БД в DLE конфиге:"
         grep -E "DBNAME|DBUSER|DBPASS" "$dbconfig_file" >&2
         
+        # Экранируем специальные символы в пароле для sed
+        local escaped_db_pass=$(echo "$new_db_pass" | sed 's/[[\.*^$()+?{|]/\\&/g')
+        
         # Обновляем настройки БД с учетом формата define ("DBNAME", "value");
         sed -i "s/define (\"DBNAME\", \"[^\"]*\")/define (\"DBNAME\", \"$new_db_name\")/" "$dbconfig_file"
         sed -i "s/define (\"DBUSER\", \"[^\"]*\")/define (\"DBUSER\", \"$new_db_user\")/" "$dbconfig_file"
-        sed -i "s/define (\"DBPASS\", \"[^\"]*\")/define (\"DBPASS\", \"$new_db_pass\")/" "$dbconfig_file"
+        sed -i "s/define (\"DBPASS\", \"[^\"]*\")/define (\"DBPASS\", \"$escaped_db_pass\")/" "$dbconfig_file"
         
         # Также обрабатываем формат с одинарными кавычками (на всякий случай)
         sed -i "s/define ('DBNAME', '[^']*')/define ('DBNAME', '$new_db_name')/" "$dbconfig_file"
         sed -i "s/define ('DBUSER', '[^']*')/define ('DBUSER', '$new_db_user')/" "$dbconfig_file"
-        sed -i "s/define ('DBPASS', '[^']*')/define ('DBPASS', '$new_db_pass')/" "$dbconfig_file"
+        sed -i "s/define ('DBPASS', '[^']*')/define ('DBPASS', '$escaped_db_pass')/" "$dbconfig_file"
         
         # Показываем обновленные настройки для проверки
         log_info "Обновленные настройки БД в DLE конфиге:"
@@ -762,7 +808,7 @@ test_dle_config_update() {
 # Основная функция
 main() {
     echo "=============================================="
-    echo "  Site Copy Script v2.1"
+    echo "  Site Copy Script v2.2"
     echo "=============================================="
     echo
     
@@ -848,6 +894,10 @@ main() {
     suggested_owner=$(suggest_site_owner "$source_site_path" "$new_site_name")
     
     case $CONTROL_PANEL in
+        "hestia")
+            echo "Для Hestia обычно используется тот же пользователь что и у исходного сайта"
+            read -p "Введите имя пользователя нового сайта (по умолчанию: $suggested_owner): " new_site_user
+            ;;
         "ispmanager")
             echo "Для ISPManager обычно используется пользователь www-root"
             read -p "Введите имя пользователя нового сайта (по умолчанию: $suggested_owner): " new_site_user
@@ -863,8 +913,15 @@ main() {
         log_info "Используем владельца по умолчанию: $new_site_user"
     fi
     
-    # Формируем путь к новому сайту
-    new_site_path="/var/www/${new_site_user}/data/www/${new_site_name}"
+    # Формируем путь к новому сайту в зависимости от панели
+    case $CONTROL_PANEL in
+        "hestia")
+            new_site_path="/home/${new_site_user}/web/${new_site_name}/public_html"
+            ;;
+        "ispmanager"|"fastpanel")
+            new_site_path="/var/www/${new_site_user}/data/www/${new_site_name}"
+            ;;
+    esac
     
     # Проверяем структуру директорий
     ensure_site_directory_structure "$new_site_user" "$new_site_name"
@@ -873,7 +930,14 @@ main() {
     fi
     
     # Проверяем свободное место
-    check_disk_space "$source_site_path" "/var/www/${new_site_user}/data/www"
+    case $CONTROL_PANEL in
+        "hestia")
+            check_disk_space "$source_site_path" "/home/${new_site_user}/web"
+            ;;
+        "ispmanager"|"fastpanel")
+            check_disk_space "$source_site_path" "/var/www/${new_site_user}/data/www"
+            ;;
+    esac
     
     # Создаем директорию сайта если её нет
     if [[ ! -d "$new_site_path" ]]; then
@@ -999,6 +1063,11 @@ main() {
     if [[ "$detected_cms" != "other" ]]; then
         log_info "Не забудьте:"
         case $CONTROL_PANEL in
+            "hestia")
+                echo "1. Настроить веб-сервер для нового сайта в Hestia"
+                echo "2. Проверить работу сайта"
+                echo "3. При необходимости обновить дополнительные настройки"
+                ;;
             "ispmanager")
                 echo "1. Настроить веб-сервер для нового сайта в ISPManager"
                 echo "2. Проверить работу сайта"
@@ -1013,6 +1082,11 @@ main() {
     else
         log_info "Не забудьте:"
         case $CONTROL_PANEL in
+            "hestia")
+                echo "1. Создать и настроить базу данных в Hestia (если требуется)"
+                echo "2. Обновить конфигурационные файлы"
+                echo "3. Настроить веб-сервер для нового сайта"
+                ;;
             "ispmanager")
                 echo "1. Создать и настроить базу данных в ISPManager (если требуется)"
                 echo "2. Обновить конфигурационные файлы"

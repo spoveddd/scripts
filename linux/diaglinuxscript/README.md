@@ -31,12 +31,6 @@
 ### Скачивание и запуск одной командой
 
 ```bash
-wget -O - https://raw.githubusercontent.com/spoveddd/scripts/main/linux/diaglinuxscript/diaglinuxscript.sh | bash
-```
-
-Или с паузой для гарантированного скачивания:
-
-```bash
 wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/diaglinuxscript/diaglinuxscript.sh && sleep 2 && bash diaglinuxscript.sh
 ```
 

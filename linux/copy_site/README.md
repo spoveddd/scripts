@@ -4,7 +4,7 @@
 
 ## Описание
 
-Этот скрипт предназначен для технической поддержки FastPanel, ISPManager и Hestia, позволяет быстро и безопасно копировать веб-сайты вместе с их базами данных. Поддерживает автоматическое определение панели управления, CMS и соответствующее обновление конфигураций.
+Этот скрипт позволяет быстро и безопасно копировать веб-сайты вместе с их базами данных (с учетом если в панели управления создан новый сайт с базой). Поддерживает автоматическое определение панели управления, CMS и соответствующее обновление конфигураций.
 
 ## Поддерживаемые панели управления
 
@@ -58,14 +58,7 @@
 
 ### Скачивание и запуск
 
-#### Способ 1: Скачать и запустить (рекомендуется)
-```bash
-wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
-chmod +x copy_site.sh
-./copy_site.sh
-```
-
-#### Способ 2: Скачать и запустить одной командой
+#### Способ 1: Скачать и запустить одной командой
 ```bash
 wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh -O copy_site.sh && chmod +x copy_site.sh && ./copy_site.sh
 ```
@@ -75,9 +68,12 @@ wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/cop
 1. Скачайте скрипт:
 ```bash
 wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
+```
+2. Установите права на выполнение:
+```bash
 chmod +x copy_site.sh
 ```
-2. Запустите скрипт:
+3. Запустите скрипт:
 ```bash
 sudo ./copy_site.sh
 ```
@@ -257,45 +253,6 @@ $ sudo ./copy_site.sh
 [2023-12-01 14:30:30] [SUCCESS] Дамп создан: /tmp/test_db_20231201_143022.sql (размер: 2.1M)
 ```
 
-## Устранение неполадок
-
-### Частые проблемы
-
-**1. "База данных не существует"**
-```bash
-# Проверьте подключение к MySQL
-mysql -e "SHOW DATABASES;"
-
-# Проверьте права пользователя
-mysql -e "SELECT User, Host FROM mysql.user;"
-```
-
-**2. "Директория не найдена"**
-```bash
-# Проверьте структуру FastPanel
-ls -la /var/www/*/data/www/
-
-# Укажите путь вручную при запросе
-```
-
-**3. "Недостаточно прав"**
-```bash
-# Запустите от root
-sudo ./copy_site.sh
-
-# Проверьте права на директории
-ls -la /var/www/username/data/www/
-```
-
-**4. "Ошибка импорта БД"**
-```bash
-# Проверьте размер дампа
-ls -lh /tmp/*_dump_*.sql
-
-# Проверьте логи MySQL
-tail -f /var/log/mysql/error.log
-```
-
 ### Отладка
 
 Для детальной диагностики добавьте в начало скрипта:
@@ -318,12 +275,6 @@ set -x  # Включить отладочный вывод
 - `import_db_dump()` - импорт дампа
 - `update_wp_config()` - обновление WordPress
 - `update_dle_config()` - обновление DLE
-
-### Добавление новой CMS
-1. Добавьте проверку в `detect_cms()`
-2. Создайте функцию `get_db_info_from_newcms_config()`
-3. Создайте функцию `update_newcms_config()`
-4. Добавьте обработку в основной функции
 
 
 ## Автор

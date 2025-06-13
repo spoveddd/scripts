@@ -1,7 +1,7 @@
 #!/bin/bash
 # Site Copy Script
 # Автор: Vladislav Pavlovich
-# Версия: 2.2
+# Версия: 2.4
 # Поддерживает: FastPanel, ISPManager, Hestia
 
 set -e
@@ -176,6 +176,13 @@ detect_control_panel() {
         return 0
     fi
     
+    # Проверяем наличие FastPanel по сервисам (приоритет)
+    if systemctl is-active --quiet fastpanel2.service 2>/dev/null || systemctl list-units --type=service | grep -q fastpanel2.service; then
+        CONTROL_PANEL="fastpanel"
+        log_success "Обнаружена панель: FastPanel"
+        return 0
+    fi
+    
     # Проверяем наличие FastPanel по характерным директориям
     if [[ -d "/usr/local/mgr5" ]] || [[ -d "/usr/local/fastpanel" ]]; then
         CONTROL_PANEL="fastpanel"
@@ -291,31 +298,57 @@ suggest_site_owner() {
     local new_site_name="$2"
     local suggested_owner=""
     
+    # Сначала проверяем, существует ли уже директория нового сайта
+    local existing_target_path=""
     case $CONTROL_PANEL in
         "hestia")
-            # Для Hestia используем владельца исходного сайта
-            local source_owner=$(get_site_owner "$source_site_path")
-            suggested_owner="$source_owner"
-            log_info "Для Hestia предлагаем владельца: $suggested_owner"
+            # Для Hestia ищем в /home/*/web/сайт/public_html
+            for user_dir in /home/*/; do
+                if [[ -d "${user_dir}web/${new_site_name}/public_html" ]]; then
+                    existing_target_path="${user_dir}web/${new_site_name}/public_html"
+                    break
+                fi
+            done
             ;;
-        "ispmanager")
-            # Для ISPManager проверяем, есть ли уже директория для нового сайта
-            if [[ -d "/var/www/www-root/data/www/${new_site_name}" ]]; then
-                suggested_owner="www-root"
-                log_info "Найдена существующая директория для сайта $new_site_name, владелец: www-root"
-            else
-                # По умолчанию www-root для ISPManager
-                suggested_owner="www-root"
-                log_info "Для ISPManager предлагаем владельца: www-root"
-            fi
-            ;;
-        "fastpanel")
-            # Для FastPanel используем логику как раньше
-            local source_owner=$(get_site_owner "$source_site_path")
-            suggested_owner="${new_site_name}_usr"
-            log_info "Для FastPanel предлагаем владельца: $suggested_owner"
+        "ispmanager"|"fastpanel")
+            # Для ISPManager и FastPanel ищем в /var/www/*/data/www/сайт
+            for user_dir in /var/www/*/; do
+                if [[ -d "${user_dir}data/www/${new_site_name}" ]]; then
+                    existing_target_path="${user_dir}data/www/${new_site_name}"
+                    break
+                fi
+            done
             ;;
     esac
+    
+    # Если директория нового сайта уже существует, извлекаем владельца оттуда
+    if [[ -n "$existing_target_path" ]]; then
+        suggested_owner=$(get_site_owner "$existing_target_path")
+        log_info "Найдена существующая директория нового сайта: $existing_target_path"
+        log_info "Предлагаем владельца из существующей директории: $suggested_owner"
+    else
+        # Если директории нет, используем стандартную логику
+        case $CONTROL_PANEL in
+            "hestia")
+                # Для Hestia используем владельца исходного сайта
+                local source_owner=$(get_site_owner "$source_site_path")
+                suggested_owner="$source_owner"
+                log_info "Для Hestia предлагаем владельца: $suggested_owner"
+                ;;
+            "ispmanager")
+                # Для ISPManager используем владельца исходного сайта (как у Hestia)
+                local source_owner=$(get_site_owner "$source_site_path")
+                suggested_owner="$source_owner"
+                log_info "Для ISPManager предлагаем владельца: $suggested_owner"
+                ;;
+            "fastpanel")
+                # Для FastPanel используем логику как раньше
+                local source_owner=$(get_site_owner "$source_site_path")
+                suggested_owner="${new_site_name}_usr"
+                log_info "Для FastPanel предлагаем владельца: $suggested_owner"
+                ;;
+        esac
+    fi
     
     echo "$suggested_owner"
 }
@@ -559,7 +592,6 @@ import_db_dump() {
     fi
     
     # Импортируем дамп с детальной диагностикой
-    log_info "Начинаем импорт дампа..."
     if mysql "$new_db_name" < "$dump_file" 2>/tmp/mysql_import_error.log; then
         log_success "Дамп успешно импортирован"
         # Удаляем файл с ошибками если импорт прошел успешно
@@ -805,10 +837,35 @@ test_dle_config_update() {
     log_info "Тест DLE завершен"
 }
 
+# Функция для проверки необходимых утилит
+check_required_utilities() {
+    log_info "Проверяем наличие необходимых утилит..."
+    
+    local required_utils=("rsync" "mysqldump" "mysql" "sed" "grep" "find" "systemctl" "du" "df" "awk")
+    local missing_utils=()
+    
+    for util in "${required_utils[@]}"; do
+        if ! command -v "$util" &>/dev/null; then
+            missing_utils+=("$util")
+        fi
+    done
+    
+    if [[ ${#missing_utils[@]} -gt 0 ]]; then
+        log_error "Отсутствуют необходимые утилиты:"
+        for util in "${missing_utils[@]}"; do
+            log_error "  - $util"
+        done
+        log_error "Установите недостающие утилиты и запустите скрипт снова"
+        exit 1
+    fi
+    
+    log_success "Все необходимые утилиты найдены"
+}
+
 # Основная функция
 main() {
     echo "=============================================="
-    echo "  Site Copy Script v2.2"
+    echo "  Site Copy Script v2.4"
     echo "=============================================="
     echo
     
@@ -816,6 +873,7 @@ main() {
     log_info "Лог файл: $LOG_FILE"
     
     check_root
+    check_required_utilities
     check_mysql_connection
     
     # Определяем панель управления
@@ -899,7 +957,7 @@ main() {
             read -p "Введите имя пользователя нового сайта (по умолчанию: $suggested_owner): " new_site_user
             ;;
         "ispmanager")
-            echo "Для ISPManager обычно используется пользователь www-root"
+            echo "Для ISPManager обычно используется тот же пользователь что и у исходного сайта"
             read -p "Введите имя пользователя нового сайта (по умолчанию: $suggested_owner): " new_site_user
             ;;
         "fastpanel")
@@ -951,16 +1009,39 @@ main() {
     if [[ "$detected_cms" != "other" ]] && [[ -n "$old_db_name" ]]; then
         echo
         echo -e "${BLUE}Шаг 3: Настройка базы данных${NC}"
-        read -p "Введите имя новой базы данных: " new_db_name
         
-        read -p "Введите имя пользователя БД: " new_db_user
+        # Ввод имени БД с проверкой
+        while true; do
+            read -p "Введите имя новой базы данных: " new_db_name
+            if [[ -n "$new_db_name" ]]; then
+                break
+            else
+                log_error "Имя базы данных не может быть пустым!"
+                echo "Попробуйте еще раз."
+            fi
+        done
         
-        read -p "Введите пароль для БД: " new_db_pass
+        # Ввод пользователя БД с проверкой
+        while true; do
+            read -p "Введите имя пользователя БД: " new_db_user
+            if [[ -n "$new_db_user" ]]; then
+                break
+            else
+                log_error "Имя пользователя БД не может быть пустым!"
+                echo "Попробуйте еще раз."
+            fi
+        done
         
-        if [[ -z "$new_db_name" ]] || [[ -z "$new_db_user" ]] || [[ -z "$new_db_pass" ]]; then
-            log_error "Все поля базы данных должны быть заполнены!"
-            exit 1
-        fi
+        # Ввод пароля БД с проверкой
+        while true; do
+            read -p "Введите пароль для БД: " new_db_pass
+            if [[ -n "$new_db_pass" ]]; then
+                break
+            else
+                log_error "Пароль БД не может быть пустым!"
+                echo "Попробуйте еще раз."
+            fi
+        done
         
         validate_db_name "$new_db_name"
         
@@ -990,7 +1071,7 @@ main() {
     echo -e "${BLUE}Шаг 4: Копирование файлов${NC}"
     log_info "Копируем файлы из $source_site_path в $new_site_path..."
     
-    if rsync -avz --quiet "$source_site_path/" "$new_site_path/"; then
+    if rsync -avz "$source_site_path/" "$new_site_path/" >/dev/null 2>&1; then
         log_success "Файлы успешно скопированы"
     else
         log_error "Ошибка при копировании файлов!"

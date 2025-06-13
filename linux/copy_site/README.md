@@ -1,4 +1,4 @@
-# FastPanel/ISPManager Site Copy Script
+#  Site Copy Script
 
 Скрипт для автоматического копирования сайтов с популярными CMS системами в среде FastPanel, ISPManager и Hestia.
 

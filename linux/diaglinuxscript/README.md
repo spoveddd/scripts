@@ -1,8 +1,5 @@
 # Linux Diagnostic Script
 
-## Автор
-**Vladislav Pavlovich**
-
 Скрипт для диагностики Linux-систем с детальной информацией о состоянии системы.
 
 ## Описание
@@ -109,5 +106,6 @@ LNS=5000 TAIL_LOG=50 ./diaglinuxscript.sh
 Скрипт распространяется свободно для использования и модификации.
 
 ---
+## Автор
+**Vladislav Pavlovich**
 
-**Создано с ❤️ Vladislav Pavlovich** 

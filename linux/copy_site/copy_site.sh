@@ -1,7 +1,7 @@
 #!/bin/bash
 # Site Copy Script
 # Автор: Vladislav Pavlovich
-# Версия: 2.4
+# Версия: 2.5
 # Поддерживает: FastPanel, ISPManager, Hestia
 
 set -e
@@ -699,7 +699,7 @@ update_dle_config() {
         grep -E "DBNAME|DBUSER|DBPASS" "$dbconfig_file" >&2
         
         # Экранируем специальные символы в пароле для sed
-        local escaped_db_pass=$(echo "$new_db_pass" | sed 's/[[\.*^$()+?{|]/\\&/g')
+        local escaped_db_pass=$(printf '%s\n' "$new_db_pass" | sed 's/[\.*^$()+?{|\\]/\\&/g')
         
         # Обновляем настройки БД с учетом формата define ("DBNAME", "value");
         sed -i "s/define (\"DBNAME\", \"[^\"]*\")/define (\"DBNAME\", \"$new_db_name\")/" "$dbconfig_file"
@@ -865,7 +865,7 @@ check_required_utilities() {
 # Основная функция
 main() {
     echo "=============================================="
-    echo "  Site Copy Script v2.4"
+    echo "  Site Copy Script v2.5"
     echo "=============================================="
     echo
     

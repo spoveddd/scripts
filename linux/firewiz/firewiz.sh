@@ -54,7 +54,7 @@ get_firewalls() {
     done
 }
 
-# Универсальный выбор по цифре
+# Универсальный выбор по цифре (с возвратом по 0, 0 внизу)
 select_from_list() {
     local prompt="$1"
     shift
@@ -64,22 +64,32 @@ select_from_list() {
     for i in "${!arr[@]}"; do
         printf "  %s) %s\n" "$((i+1))" "${arr[$i]}"
     done
+    printf "  0) Вернуться в меню\n"
     local num
     while true; do
         read -p "Номер: " num
-        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#arr[@]}" ]; then
+        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 0 ] && [ "$num" -le "${#arr[@]}" ]; then
             break
         fi
         printf "${RED}Некорректный номер!${RESET}\n"
     done
+    if [ "$num" = "0" ]; then
+        SELECTED_INDEX=-1
+        SELECTED_VALUE=""
+        return 1
+    fi
     SELECTED_INDEX=$((num-1))
     SELECTED_VALUE="${arr[$SELECTED_INDEX]}"
+    return 0
 }
 
 # Выбор firewall по номеру
 select_firewall() {
     get_firewalls
     select_from_list "Выберите firewall:" "${FWS[@]}"
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
     FW_SELECTED="$SELECTED_VALUE"
 }
 
@@ -88,13 +98,33 @@ select_action() {
     local prompt="$1"
     shift
     local actions=("$@")
+    # Если действия — стандартные для firewall, показываем на русском
+    if [ "${actions[*]}" = "allow deny reject" ]; then
+        select_from_list "$prompt" "Разрешить" "Запретить" "Отклонить"
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+        case $SELECTED_INDEX in
+            0) ACTION_SELECTED="allow" ;;
+            1) ACTION_SELECTED="deny" ;;
+            2) ACTION_SELECTED="reject" ;;
+        esac
+        return 0
+    fi
     select_from_list "$prompt" "${actions[@]}"
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
     ACTION_SELECTED="$SELECTED_VALUE"
+    return 0
 }
 
 # Универсальный выбор протокола (tcp/udp)
 select_protocol() {
     select_from_list "Выберите протокол:" "tcp" "udp"
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
     PROTO_SELECTED="$SELECTED_VALUE"
 }
 
@@ -278,26 +308,75 @@ is_iptables_nft_backend() {
 # Универсальный вывод всех правил (сначала анализ, потом меню)
 show_all_rules() {
     print_header
-    if is_iptables_nft_backend; then
-        for fw in $FIREWALLS; do
-            case $fw in
-                iptables) parse_iptables iptables ;;
-                ip6tables) parse_iptables ip6tables ;;
-                ufw) parse_ufw ;;
-                firewalld) parse_firewalld ;;
+    for fw in $FIREWALLS; do
+        parse_rules_for_removal $fw
+        local allow_ports=""; local deny_ports=""; local allow_ips=""; local deny_ips=""; local allow_subnets=""; local deny_subnets=""
+        local first_allow_port=1; local first_deny_port=1; local first_allow_ip=1; local first_deny_ip=1; local first_allow_subnet=1; local first_deny_subnet=1
+        local ufw_inactive=0
+        for rule in "${RULES[@]}"; do
+            IFS='|' read -r type value action _ ip_or_subnet <<< "$rule"
+            case $type in
+                ufw_inactive)
+                    printf "${BOLD}${MAGENTA}--- ufw ---${RESET}\n"
+                    printf "${CYAN}%s${RESET}\n" "$value"
+                    printf "${YELLOW}ufw выключен. Правила неактивны.${RESET}\n\n"
+                    ufw_inactive=1
+                    ;;
+                port)
+                    if [ "$action" = "ACCEPT" ]; then
+                        [ $first_allow_port -eq 0 ] && allow_ports+=", "
+                        allow_ports+="$value"; first_allow_port=0
+                    else
+                        [ $first_deny_port -eq 0 ] && deny_ports+=", "
+                        deny_ports+="$value"; first_deny_port=0
+                    fi
+                    ;;
+                address)
+                    if [ "$action" = "ACCEPT" ]; then
+                        [ $first_allow_ip -eq 0 ] && allow_ips+=", "
+                        allow_ips+="$value"; first_allow_ip=0
+                    else
+                        [ $first_deny_ip -eq 0 ] && deny_ips+=", "
+                        deny_ips+="$value"; first_deny_ip=0
+                    fi
+                    ;;
+                subnet)
+                    if [ "$action" = "ACCEPT" ]; then
+                        [ $first_allow_subnet -eq 0 ] && allow_subnets+=", "
+                        allow_subnets+="$value"; first_allow_subnet=0
+                    else
+                        [ $first_deny_subnet -eq 0 ] && deny_subnets+=", "
+                        deny_subnets+="$value"; first_deny_subnet=0
+                    fi
+                    ;;
+                portip)
+                    if [ "$action" = "ACCEPT" ]; then
+                        [ $first_allow_port -eq 0 ] && allow_ports+=", "
+                        allow_ports+="$value(для адреса $ip_or_subnet)"; first_allow_port=0
+                    else
+                        [ $first_deny_port -eq 0 ] && deny_ports+=", "
+                        deny_ports+="$value(для адреса $ip_or_subnet)"; first_deny_port=0
+                    fi
+                    ;;
+                portsubnet)
+                    if [ "$action" = "ACCEPT" ]; then
+                        [ $first_allow_port -eq 0 ] && allow_ports+=", "
+                        allow_ports+="$value(для подсети $ip_or_subnet)"; first_allow_port=0
+                    else
+                        [ $first_deny_port -eq 0 ] && deny_ports+=", "
+                        deny_ports+="$value(для подсети $ip_or_subnet)"; first_deny_port=0
+                    fi
+                    ;;
             esac
         done
-    else
-        for fw in $FIREWALLS; do
-            case $fw in
-                iptables) parse_iptables iptables ;;
-                ip6tables) parse_iptables ip6tables ;;
-                nftables) parse_nftables ;;
-                ufw) parse_ufw ;;
-                firewalld) parse_firewalld ;;
-            esac
-        done
-    fi
+        # Если ufw неактивен — уже выведено, пропускаем
+        if [ "$fw" = "ufw" ] && [ $ufw_inactive -eq 1 ]; then
+            continue
+        fi
+        printf "${BOLD}${MAGENTA}--- $fw ---${RESET}\n"
+        printf "${GREEN}Разрешены:${RESET}\n  Порты: $allow_ports\n  Адреса: $allow_ips\n  Подсети: $allow_subnets\n"
+        printf "${RED}Заблокированы:${RESET}\n  Порты: $deny_ports\n  Адреса: $deny_ips\n  Подсети: $deny_subnets\n\n"
+    done
 }
 
 # Проверка валидности IP-адреса или подсети (IPv4/IPv6)
@@ -317,9 +396,9 @@ is_valid_ip() {
 # Добавление правила (выбор firewall и действия по номеру, с проверкой ошибок, выбор протокола по цифре, проверка IP)
 add_rule() {
     printf "${BOLD}${GREEN}Добавление правила${RESET}\n"
-    select_firewall
+    select_firewall || return
     read -p "Порт: " port
-    select_protocol
+    select_protocol || return
     proto="$PROTO_SELECTED"
     while true; do
         read -p "IP [Enter для всех]: " ip
@@ -330,7 +409,7 @@ add_rule() {
             printf "${RED}Некорректный IP-адрес или подсеть!${RESET}\n"
         fi
     done
-    select_action "Действие:" "allow" "deny" "reject"
+    select_action "Действие:" "allow" "deny" "reject" || return
     action="$ACTION_SELECTED"
     local cmd_result=0
     local cmd_out=""
@@ -404,38 +483,241 @@ add_rule() {
     fi
 }
 
-# Удаление правила (выбор firewall по номеру, показываю только INPUT, после удаления только подтверждение)
-remove_rule() {
-    printf "${BOLD}${RED}Удаление правила${RESET}\n"
-    select_firewall
-    case $FW_SELECTED in
-        iptables)
-            iptables -L INPUT --line-numbers
-            read -p "Номер правила для удаления: " num
-            iptables -D INPUT $num
-            ;;
-        ip6tables)
-            ip6tables -L INPUT --line-numbers
-            read -p "Номер правила для удаления: " num
-            ip6tables -D INPUT $num
+# Универсальный парсер правил для удаления (возвращает массив RULES: type|value|action|orig_num|ip_or_subnet)
+parse_rules_for_removal() {
+    local fw="$1"
+    RULES=()
+    case $fw in
+        iptables|ip6tables)
+            local cmd="$fw -L INPUT --line-numbers -n"
+            while read -r line; do
+                [[ "$line" =~ ^Chain ]] && continue
+                [[ "$line" =~ ^num ]] && continue
+                num=$(echo "$line" | awk '{print $1}')
+                action=$(echo "$line" | awk '{print $2}')
+                proto=$(echo "$line" | awk '{print $3}')
+                src=$(echo "$line" | awk '{print $5}')
+                dport=$(echo "$line" | grep -oE 'dpt:[0-9]+' | cut -d: -f2)
+                if [[ "$action" =~ ACCEPT|DROP|REJECT ]]; then
+                    if [ -n "$dport" ] && [ "$src" != "0.0.0.0/0" ] && [ "$src" != "::/0" ]; then
+                        # Порт + адрес/подсеть
+                        if echo "$src" | grep -q '/'; then
+                            mask=$(echo "$src" | cut -d'/' -f2)
+                            if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                                RULES+=("portip|$dport/$proto|$action|$num|$(echo "$src" | cut -d'/' -f1)")
+                            else
+                                RULES+=("portsubnet|$dport/$proto|$action|$num|$src")
+                            fi
+                        else
+                            RULES+=("portip|$dport/$proto|$action|$num|$src")
+                        fi
+                    elif [ -n "$dport" ]; then
+                        RULES+=("port|$dport/$proto|$action|$num|")
+                    elif [ "$src" != "0.0.0.0/0" ] && [ "$src" != "::/0" ]; then
+                        if echo "$src" | grep -q '/'; then
+                            mask=$(echo "$src" | cut -d'/' -f2)
+                            if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                                RULES+=("address|$(echo "$src" | cut -d'/' -f1)|$action|$num|")
+                            else
+                                RULES+=("subnet|$src|$action|$num|")
+                            fi
+                        else
+                            RULES+=("address|$src|$action|$num|")
+                        fi
+                    fi
+                fi
+            done < <(eval $cmd)
             ;;
         nftables)
-            printf "Удаление вручную: используйте 'nft delete rule ...'\n"
+            local i=1
+            # Проверяем наличие цепочки
+            if ! nft list chain inet filter input 2>/dev/null | grep -q .; then
+                RULES+=("nft_no_rules|Нет правил|Нет правил|Нет правил|Нет правил")
+                return
+            fi
+            nft list chain inet filter input | grep -v '^table' | grep -v '^chain' | while read -r line; do
+                action=""
+                proto=""
+                dport=""
+                src=""
+                if echo "$line" | grep -q 'accept'; then action="ACCEPT"; fi
+                if echo "$line" | grep -q 'drop'; then action="DROP"; fi
+                if echo "$line" | grep -q 'reject'; then action="REJECT"; fi
+                proto=$(echo "$line" | grep -oE 'tcp|udp')
+                dport=$(echo "$line" | grep -oE 'dport [0-9]+' | awk '{print $2}')
+                src=$(echo "$line" | grep -oE 'saddr [^ ]+' | awk '{print $2}')
+                if [ -n "$dport" ] && [ -n "$src" ] && [ "$src" != "0.0.0.0/0" ] && [ "$src" != "::/0" ]; then
+                    if echo "$src" | grep -q '/'; then
+                        mask=$(echo "$src" | cut -d'/' -f2)
+                        if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                            RULES+=("portip|$dport/$proto|$action|$i|$(echo "$src" | cut -d'/' -f1)")
+                        else
+                            RULES+=("portsubnet|$dport/$proto|$action|$i|$src")
+                        fi
+                    else
+                        RULES+=("portip|$dport/$proto|$action|$i|$src")
+                    fi
+                elif [ -n "$dport" ]; then
+                    RULES+=("port|$dport/$proto|$action|$i|")
+                elif [ -n "$src" ] && [ "$src" != "0.0.0.0/0" ] && [ "$src" != "::/0" ]; then
+                    if echo "$src" | grep -q '/'; then
+                        mask=$(echo "$src" | cut -d'/' -f2)
+                        if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                            RULES+=("address|$(echo "$src" | cut -d'/' -f1)|$action|$i|")
+                        else
+                            RULES+=("subnet|$src|$action|$i|")
+                        fi
+                    else
+                        RULES+=("address|$src|$action|$i|")
+                    fi
+                fi
+                i=$((i+1))
+            done
             ;;
         ufw)
-            ufw status numbered
-            read -p "Номер правила для удаления: " num
-            ufw delete $num
+            local status=""
+            status=$(ufw status | grep 'Status:')
+            if echo "$status" | grep -qi inactive; then
+                RULES+=("ufw_inactive|$status||||")
+                return
+            fi
+            local i=1
+            ufw status numbered | grep -E 'ALLOW|DENY|REJECT' | while read -r line; do
+                action=""
+                proto=""
+                dport=""
+                src=""
+                if echo "$line" | grep -q 'ALLOW'; then action="ACCEPT"; fi
+                if echo "$line" | grep -q 'DENY'; then action="DROP"; fi
+                if echo "$line" | grep -q 'REJECT'; then action="REJECT"; fi
+                dport=$(echo "$line" | awk '{print $1}' | cut -d'/' -f1)
+                proto=$(echo "$line" | grep -oE '/[a-z]+' | tr -d '/')
+                src=$(echo "$line" | awk '{print $3}')
+                if [ -n "$dport" ] && [ "$src" != "Anywhere" ] && [ -n "$src" ]; then
+                    if echo "$src" | grep -q '/'; then
+                        mask=$(echo "$src" | cut -d'/' -f2)
+                        if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                            RULES+=("portip|$dport/$proto|$action|$i|$(echo "$src" | cut -d'/' -f1)")
+                        else
+                            RULES+=("portsubnet|$dport/$proto|$action|$i|$src")
+                        fi
+                    else
+                        RULES+=("portip|$dport/$proto|$action|$i|$src")
+                    fi
+                elif [ -n "$dport" ]; then
+                    RULES+=("port|$dport/$proto|$action|$i|")
+                elif [ "$src" != "Anywhere" ] && [ -n "$src" ]; then
+                    if echo "$src" | grep -q '/'; then
+                        mask=$(echo "$src" | cut -d'/' -f2)
+                        if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                            RULES+=("address|$(echo "$src" | cut -d'/' -f1)|$action|$i|")
+                        else
+                            RULES+=("subnet|$src|$action|$i|")
+                        fi
+                    else
+                        RULES+=("address|$src|$action|$i|")
+                    fi
+                fi
+                i=$((i+1))
+            done
             ;;
         firewalld)
-            firewall-cmd --list-ports
-            read -p "Порт/протокол для удаления (например, 80/tcp): " portproto
-            firewall-cmd --remove-port=$portproto --permanent
-            firewall-cmd --reload
+            local i=1
+            for zone in $(firewall-cmd --get-active-zones | awk 'NR%2==1'); do
+                for port in $(firewall-cmd --zone=$zone --list-ports); do
+                    RULES+=("port|$port|ACCEPT|$i|")
+                    i=$((i+1))
+                done
+                for src in $(firewall-cmd --zone=$zone --list-sources); do
+                    if echo "$src" | grep -q '/'; then
+                        mask=$(echo "$src" | cut -d'/' -f2)
+                        if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                            RULES+=("address|$(echo "$src" | cut -d'/' -f1)|ACCEPT|$i|")
+                        else
+                            RULES+=("subnet|$src|ACCEPT|$i|")
+                        fi
+                    else
+                        RULES+=("address|$src|ACCEPT|$i|")
+                    fi
+                    i=$((i+1))
+                done
+                for rich in $(firewall-cmd --zone=$zone --list-rich-rules); do
+                    if echo "$rich" | grep -q 'reject'; then
+                        src=$(echo "$rich" | grep -oE 'address=\"[^\"]+\"' | cut -d'"' -f2)
+                        if [ -n "$src" ]; then
+                            if echo "$src" | grep -q '/'; then
+                                mask=$(echo "$src" | cut -d'/' -f2)
+                                if [ "$mask" = "32" ] || [ "$mask" = "128" ]; then
+                                    RULES+=("address|$(echo "$src" | cut -d'/' -f1)|DROP|$i|")
+                                else
+                                    RULES+=("subnet|$src|DROP|$i|")
+                                fi
+                            else
+                                RULES+=("address|$src|DROP|$i|")
+                            fi
+                        fi
+                        i=$((i+1))
+                    fi
+                done
+            done
             ;;
-        *) printf "${RED}Неизвестный firewall${RESET}\n" ;;
     esac
-    printf "${GREEN}Правило удалено!${RESET}\n"
+}
+
+# Универсальное удаление правила по номеру из списка (с возвратом по 0)
+remove_rule() {
+    printf "${BOLD}${RED}Удаление правила${RESET}\n"
+    select_firewall || return
+    while true; do
+        parse_rules_for_removal $FW_SELECTED
+        if [ ${#RULES[@]} -eq 0 ]; then
+            printf "${YELLOW}Нет правил для удаления.${RESET}\n"
+            return
+        fi
+        printf "Выберите правило для удаления:\n"
+        local i=1
+        for rule in "${RULES[@]}"; do
+            IFS='|' read -r type value action orig_num ip_or_subnet <<< "$rule"
+            case $type in
+                ufw_inactive) desc="ufw выключен: $value" ;;
+                port)    desc="Порт: $value ($action)" ;;
+                address) desc="Адрес: $value ($action)" ;;
+                subnet)  desc="Подсеть: $value ($action)" ;;
+                portip)  desc="Порт: $value ($action, адрес $ip_or_subnet)" ;;
+                portsubnet) desc="Порт: $value ($action, подсеть $ip_or_subnet)" ;;
+            esac
+            printf "  %d) %s\n" "$i" "$desc"
+            i=$((i+1))
+        done
+        printf "  0) Вернуться в меню\n"
+        local num
+        while true; do
+            read -p "Номер: " num
+            if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 0 ] && [ "$num" -le ${#RULES[@]} ]; then
+                break
+            fi
+            printf "${RED}Некорректный номер!${RESET}\n"
+        done
+        if [ "$num" = "0" ]; then
+            return
+        fi
+        IFS='|' read -r type value action orig_num ip_or_subnet <<< "${RULES[$((num-1))]}"
+        case $FW_SELECTED in
+            iptables|ip6tables)
+                $FW_SELECTED -D INPUT $orig_num
+                ;;
+            nftables)
+                printf "Удаление вручную: используйте 'nft delete rule ...'\n"
+                ;;
+            ufw)
+                ufw delete $orig_num
+                ;;
+            firewalld)
+                printf "Удаление вручную: используйте firewall-cmd ...\n"
+                ;;
+        esac
+        printf "${GREEN}Правило удалено!${RESET}\n"
+    done
 }
 
 # Сохранение изменений (создаю /etc/iptables если нужно, для ufw показываю предупреждение если неактивен)
@@ -521,17 +803,17 @@ restore_ip6tables_backup() {
     fi
 }
 
-# В меню: восстановить правила из бэкапа
+# Восстановление из бэкапа (с возвратом по 0)
 restore_menu() {
     printf "${BOLD}${CYAN}Восстановление правил из бэкапа${RESET}\n"
-    select_firewall
+    select_firewall || return
     case $FW_SELECTED in
         iptables)
             files=(/root/iptables_backup_*.rules)
             if [ ! -e "${files[0]}" ]; then
                 printf "${RED}Бэкапы не найдены!${RESET}\n"; return
             fi
-            select_from_list "Выберите файл для восстановления:" "${files[@]}"
+            select_from_list "Выберите файл для восстановления:" "${files[@]}" || return
             restore_iptables_backup "$SELECTED_VALUE"
             ;;
         ip6tables)
@@ -539,7 +821,7 @@ restore_menu() {
             if [ ! -e "${files[0]}" ]; then
                 printf "${RED}Бэкапы не найдены!${RESET}\n"; return
             fi
-            select_from_list "Выберите файл для восстановления:" "${files[@]}"
+            select_from_list "Выберите файл для восстановления:" "${files[@]}" || return
             restore_ip6tables_backup "$SELECTED_VALUE"
             ;;
         *) printf "${RED}Восстановление поддерживается только для iptables и ip6tables${RESET}\n" ;;
@@ -615,7 +897,7 @@ set_firewall_state() {
 # Новый пункт: Заблокировать адрес полностью (с проверкой IP)
 block_ip_menu() {
     printf "${BOLD}${RED}Заблокировать адрес полностью${RESET}\n"
-    select_firewall
+    select_firewall || return
     while true; do
         read -p "IP-адрес или подсеть для блокировки: " ip
         if is_valid_ip "$ip"; then
@@ -668,6 +950,43 @@ block_ip_menu() {
     fi
 }
 
+reset_firewall() {
+    printf "${BOLD}${YELLOW}Сброс всех правил firewall${RESET}\n"
+    for fw in $FIREWALLS; do
+        case $fw in
+            iptables)
+                iptables -F
+                iptables -X
+                iptables -P INPUT ACCEPT
+                iptables -P OUTPUT ACCEPT
+                iptables -P FORWARD ACCEPT
+                printf "${GREEN}iptables: все правила удалены, политика ACCEPT${RESET}\n"
+                ;;
+            ip6tables)
+                ip6tables -F
+                ip6tables -X
+                ip6tables -P INPUT ACCEPT
+                ip6tables -P OUTPUT ACCEPT
+                ip6tables -P FORWARD ACCEPT
+                printf "${GREEN}ip6tables: все правила удалены, политика ACCEPT${RESET}\n"
+                ;;
+            nftables)
+                nft flush ruleset
+                printf "${GREEN}nftables: все правила удалены${RESET}\n"
+                ;;
+            ufw)
+                ufw --force reset
+                printf "${GREEN}ufw: все правила удалены, firewall выключен${RESET}\n"
+                ;;
+            firewalld)
+                firewall-cmd --complete-reload
+                printf "${GREEN}firewalld: все правила сброшены (complete-reload)${RESET}\n"
+                ;;
+        esac
+    done
+    printf "${GREEN}Все firewall сброшены к разрешающим правилам!${RESET}\n"
+}
+
 # Главное меню (добавляю пункт блокировки адреса)
 main_menu() {
     show_all_rules
@@ -680,6 +999,7 @@ main_menu() {
         printf "${YELLOW}5${RESET} - Сохранить изменения\n"
         printf "${YELLOW}6${RESET} - Включить/отключить firewall\n"
         printf "${YELLOW}7${RESET} - Восстановить правила из бэкапа\n"
+        printf "${YELLOW}8${RESET} - Сбросить firewall (очистить все правила)\n"
         printf "${YELLOW}0${RESET} - Выход\n"
         read -p "Выберите действие: " choice
         case $choice in
@@ -690,6 +1010,7 @@ main_menu() {
             5) save_rules ;;
             6) set_firewall_state ;;
             7) restore_menu ;;
+            8) reset_firewall ;;
             0) exit 0 ;;
             *) printf "${RED}Неверный выбор!${RESET}\n" ;;
         esac

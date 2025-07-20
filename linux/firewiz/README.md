@@ -35,7 +35,7 @@ wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/firewiz/firew
 
 1. Скачайте скрипт:
     ```bash
-    wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/firewiz.sh
+    wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/firewiz/firewiz.sh
     ```
 2. Установите права на выполнение:
     ```bash

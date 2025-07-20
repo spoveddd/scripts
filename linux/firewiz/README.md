@@ -28,7 +28,7 @@
 ### Способ 1: Скачать и запустить одной командой
 
 ```bash
-wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/firewiz.sh -O firewiz.sh && chmod +x firewiz.sh && sudo ./firewiz.sh
+wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/firewiz/firewiz.sh -O firewiz.sh && chmod +x firewiz.sh && sudo ./firewiz.sh
 ```
 
 ### Способ 2: Установка вручную

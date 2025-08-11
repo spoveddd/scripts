@@ -733,7 +733,7 @@ update_dle_config() {
         grep "http_home_url" "$config_file" >&2
         
         # Обновляем URL сайта
-        sed -i "s|'http_home_url' => '[^']*'|'http_home_url' => 'http://$new_site_url'|" "$config_file"
+        sed -i "s|'http_home_url' => '[^']*'|'http_home_url' => 'https://$new_site_url'|" "$config_file"
         
         # Показываем обновленный URL
         log_info "Обновленный URL в DLE конфиге:"

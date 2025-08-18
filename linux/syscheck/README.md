@@ -23,11 +23,23 @@
 7. **Пользователи и права** - проверка sudo-доступа
 8. **Дополнительные проверки** - логи, systemd units, SSH конфигурация
 
+## Быстрый запуск
+
+### Вариант 1: curl + bash (рекомендуется)
+```bash
+bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/syscheck/syscheck.sh)
+```
+### Вариант 2: wget + bash
+```bash
+wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/syscheck/syscheck.sh && sleep 2 && bash syscheck.sh
+```
+
 ## Установка
 
+### Скачать и установить
 ```bash
 # Скачать скрипт
-wget https://raw.githubusercontent.com/your-repo/syscheck/main/syscheck.sh
+wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/syscheck/syscheck.sh
 
 # Сделать исполняемым
 chmod +x syscheck.sh
@@ -36,26 +48,14 @@ chmod +x syscheck.sh
 ./syscheck.sh
 ```
 
-## Использование
-
-### Базовый запуск
+### Установить в систему
 ```bash
-./syscheck.sh
-```
+# Скачать и установить в /usr/local/bin
+sudo wget -O /usr/local/bin/syscheck https://raw.githubusercontent.com/spoveddd/scripts/main/linux/syscheck/syscheck.sh
+sudo chmod +x /usr/local/bin/syscheck
 
-### Запуск с перенаправлением вывода
-```bash
-./syscheck.sh > system_check_$(date +%Y%m%d_%H%M%S).log 2>&1
-```
-
-### Запуск с проверкой кода возврата
-```bash
-./syscheck.sh
-case $? in
-    0) echo "Система в порядке" ;;
-    1) echo "Есть предупреждения" ;;
-    2) echo "Критические проблемы!" ;;
-esac
+# Теперь можно запускать из любой директории
+syscheck
 ```
 
 ## Коды возврата
@@ -161,4 +161,4 @@ MIT License
 
 ## Поддержка
 
-При обнаружении проблем или предложениях по улучшению создавайте issue в репозитории. 
+При обнаружении проблем или предложениях по улучшению создавайте issue в репозитории. Также сообщите в Telegram @spoveddd

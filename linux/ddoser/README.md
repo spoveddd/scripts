@@ -9,7 +9,11 @@
 ## Быстрый запуск одной командой
 
 ```bash
-wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/ddoser/ddoser.sh && sleep 2 && bash ddoser.sh
+# Самый быстрый способ - запуск напрямую
+bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/ddoser/ddoser.sh)
+
+# Альтернативный способ
+curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/ddoser/ddoser.sh | bash
 ```
 
 ---

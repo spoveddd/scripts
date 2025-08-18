@@ -30,10 +30,20 @@ Server Manager — это комплексный Bash-скрипт, которы
 
 ## Быстрый старт
 
+### Мгновенный запуск (без скачивания)
+```bash
+# Самый быстрый способ - запуск напрямую
+bash <(curl -s https://raw.githubusercontent.com/spoveddd/LEMPScript/main/servermanager.sh)
+
+# Альтернативный способ
+curl -s https://raw.githubusercontent.com/spoveddd/LEMPScript/main/servermanager.sh | bash
+```
+
+### Классическая установка
 1. Скачайте скрипт:
 
 ```bash
-wget https://github.com/spoveddd/LEMPScript/blob/main/servermanager.sh
+wget https://raw.githubusercontent.com/spoveddd/LEMPScript/main/servermanager.sh
 ```
 
 2. Сделайте его исполняемым:

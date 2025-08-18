@@ -60,7 +60,11 @@
 
 #### Способ 1: Скачать и запустить одной командой
 ```bash
-wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh -O copy_site.sh && chmod +x copy_site.sh && ./copy_site.sh
+# Самый быстрый способ - запуск напрямую
+bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh)
+
+# Альтернативный способ
+curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh | bash
 ```
 
 ## Установка

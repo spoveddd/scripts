@@ -387,10 +387,10 @@ suggest_site_owner() {
                 log_info "Для ISPManager предлагаем владельца: $suggested_owner"
                 ;;
                     "fastpanel")
-                # Для FastPanel используем логику как раньше
+                # Для FastPanel используем логику как раньше с исправленной заменой дефисов
                 local source_owner=$(get_site_owner "$source_site_path")
-                # Заменяем точки на подчеркивания для соблюдения логики FastPanel
-                suggested_owner=$(echo "${new_site_name}" | sed 's/\./_/g')"_usr"
+                # Заменяем точки и дефисы на подчеркивания для соблюдения логики FastPanel
+                suggested_owner=$(echo "${new_site_name}" | sed 's/[.-]/_/g')"_usr"
                 log_info "Для FastPanel предлагаем владельца: $suggested_owner"
                 ;;
         esac
@@ -1857,10 +1857,9 @@ main() {
         echo -e "${BLUE}Шаг 3: Настройка базы данных${NC}"
         
         # Автоматически генерируем имена для БД
-        # Автоматически генерируем имена для БД
         if [[ "$CONTROL_PANEL" == "fastpanel" ]]; then
             # Для FastPanel ограничиваем длину имен БД до 16 символов
-            local base_name=$(echo "${new_site_name}" | sed 's/\./_/g')
+            local base_name=$(echo "${new_site_name}" | sed 's/[.-]/_/g')
             # Если имя слишком длинное, обрезаем его для БД
             if [[ ${#base_name} -gt 12 ]]; then
                 base_name="${base_name:0:12}"
@@ -1869,9 +1868,10 @@ main() {
             new_db_name="${base_name}_db"
             new_db_user="${base_name}_usr"
         else
-            # Для других панелей используем стандартную логику
-            new_db_name="${new_site_name//./_}_db"
-            new_db_user="${new_site_name//./_}_usr"
+            # Для других панелей используем стандартную логику с заменой дефисов и точек
+            local base_name=$(echo "${new_site_name}" | sed 's/[.-]/_/g')
+            new_db_name="${base_name}_db"
+            new_db_user="${base_name}_usr"
         fi
         new_db_pass=$(generate_random_password)
         

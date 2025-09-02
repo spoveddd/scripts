@@ -1460,14 +1460,15 @@ create_database_via_cli() {
             create_hestia_database "$user" "$db_name" "$db_user" "$db_pass"
             ;;
         "fastpanel")
-            # Для FastPanel используем имя сайта из временного файла
+            # Для FastPanel используем переданного пользователя или из временного файла
+            local site_user="$user"
             if [[ -f /tmp/fastpanel_site_user.info ]]; then
-                local site_user=$(cat /tmp/fastpanel_site_user.info | cut -d'|' -f1)
-                create_fastpanel_database "$site_user" "$db_name" "$db_user" "$db_pass"
+                site_user=$(cat /tmp/fastpanel_site_user.info | cut -d'|' -f1)
+                log_info "Используем пользователя из временного файла: $site_user"
             else
-                log_error "Информация о пользователе FastPanel не найдена!"
-                return 1
+                log_info "Используем переданного пользователя для FastPanel: $site_user"
             fi
+            create_fastpanel_database "$site_user" "$db_name" "$db_user" "$db_pass"
             ;;
         "ispmanager")
             create_ispmanager_database "$user" "$db_name" "$db_user" "$db_pass"

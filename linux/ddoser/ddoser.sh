@@ -131,15 +131,72 @@ esac
 TODAY=$(date '+%d/%b/%Y')
 HOUR=$(date '+%H')
 
-# Анализ логов: топ IP, топ URI, топ User-Agent
+# Анализ логов: топ IP, топ URI, топ User-Agent с геолокацией
 analyze_logs() {
     local log_paths=("${PANEL_LOG_PATHS[@]}")
-    echo -e "${YELLOW}${BOLD}Топ IP по логам за сегодня:${NC}"
-    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -20 | tee /tmp/ddoser_top_ip.log
+    echo -e "${YELLOW}${BOLD}Анализирую логи за сегодня...${NC}"
+    
+    # Показываем прогресс
+    show_progress 1 4 "Подготовка данных"
+    sleep 0.5
+    
+    show_progress 2 4 "Обработка логов"
+    sleep 0.3
+    
+    show_progress 3 4 "Анализ результатов"
+    sleep 0.3
+    
+    show_progress 4 4 "Формирование отчёта"
+    sleep 0.2
+    echo # Новая строка после прогресс-бара
+    
+    # Топ IP с геолокацией
+    echo -e "\n${YELLOW}${BOLD}Топ IP по логам за сегодня:${NC}"
+    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -20 | while read count ip; do
+        if [[ -n "$ip" ]]; then
+            local ip_info=$(get_ip_info "$ip")
+            printf "%8s %-15s %s\n" "$count" "$ip" "$ip_info"
+        fi
+    done | tee /tmp/ddoser_top_ip.log
+    
+    # Топ URI
     echo -e "\n${CYAN}${BOLD}Топ URI за сегодня:${NC}"
     grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk '{print $7}' | sort | uniq -c | sort -nr | head -20 | tee /tmp/ddoser_top_uri.log
+    
+    # Топ User-Agent
     echo -e "\n${MAGENTA}${BOLD}Топ User-Agent за сегодня:${NC}"
-    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk -F'"' '{print $6}' | sort | uniq -c | sort -nr | head -10 | tee /tmp/ddoser_top_ua.log
+    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk -F'"' '{print $6}' | sort | uniq -c | sort -nr | head -15 | tee /tmp/ddoser_top_ua.log
+    
+    # Простой анализ SQL injection в URI
+    local sql_attacks=$(grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | grep -i "union\|select\|insert\|delete\|update" | awk '{print $1}' | sort | uniq -c | sort -nr)
+    if [[ -n "$sql_attacks" ]]; then
+        echo -e "\n${RED}${BOLD}🔴 Обнаружены потенциальные SQL injection атаки (топ-10):${NC}"
+        echo "$sql_attacks" | head -10 | while read count ip; do
+            if [[ -n "$ip" ]]; then
+                local ip_info=$(get_ip_info "$ip")
+                printf "%8s %-15s %s\n" "$count" "$ip" "$ip_info"
+            fi
+        done
+    fi
+    
+    # Простой анализ XSS в URI
+    local xss_attacks=$(grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | grep -i "script\|alert\|onerror\|onload\|javascript" | awk '{print $1}' | sort | uniq -c | sort -nr)
+    if [[ -n "$xss_attacks" ]]; then
+        echo -e "\n${RED}${BOLD}🔴 Обнаружены потенциальные XSS атаки (топ-10):${NC}"
+        echo "$xss_attacks" | head -10 | while read count ip; do
+            if [[ -n "$ip" ]]; then
+                local ip_info=$(get_ip_info "$ip")
+                printf "%8s %-15s %s\n" "$count" "$ip" "$ip_info"
+            fi
+        done
+    fi
+    
+    # Простой анализ ботов в User-Agent
+    local bot_agents=$(grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk -F'"' '{print $6}' | grep -i "bot\|crawler\|spider\|scraper\|scanner" | sort | uniq -c | sort -nr)
+    if [[ -n "$bot_agents" ]]; then
+        echo -e "\n${BLUE}${BOLD}🤖 Обнаружены боты (топ-10):${NC}"
+        echo "$bot_agents" | head -10
+    fi
 }
 
 # Анализ сетевых соединений
@@ -163,11 +220,14 @@ show_load() {
 # Блокировка IP (генерация команд)
 block_ip() {
     local ip="$1"
-    echo -e "${RED}${BOLD}Команды для блокировки IP $ip:${NC}"
-    echo "iptables -I INPUT -s $ip -j DROP"
-    echo "ipset add blacklist $ip"
-    echo "ufw deny from $ip"
-    log_action "Сгенерирована команда блокировки для $ip"
+    local ip_info=$(get_ip_info "$ip")
+    echo -e "${RED}${BOLD}Команды для блокировки IP $ip $ip_info:${NC}"
+    echo -e "${YELLOW}iptables:${NC} iptables -I INPUT -s $ip -j DROP"
+    echo -e "${YELLOW}ipset:${NC} ipset add blacklist $ip"
+    echo -e "${YELLOW}ufw:${NC} ufw deny from $ip"
+    echo -e "${YELLOW}Чтобы выполнить:${NC}"
+    echo -e "${CYAN}iptables -I INPUT -s $ip -j DROP && echo 'IP $ip заблокирован'${NC}"
+    log_action "Сгенерирована команда блокировки для $ip $ip_info"
 }
 
 # Сохранить действия
@@ -214,15 +274,134 @@ real_time_monitoring() {
     rm -f "$tmpfile"
 }
 
+# Прогресс-бар
+show_progress() {
+    local current=$1
+    local total=$2
+    local message=$3
+    local width=50
+    local progress=$((current * width / total))
+    local percentage=$((current * 100 / total))
+    
+    printf "\r${CYAN}$message: [${NC}"
+    for ((i=0; i<progress; i++)); do printf "${GREEN}█${NC}"; done
+    for ((i=progress; i<width; i++)); do printf "░"; done
+    printf "${CYAN}] %d%%${NC}" $percentage
+}
+
+# Глобальная переменная для отслеживания статуса whois
+WHOIS_STATUS="unknown"
+WHOIS_INSTALL_ATTEMPTED=false
+WHOIS_FAILED_COUNT=0
+
+# Функция для получения информации о IP
+get_ip_info() {
+    local ip="$1"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # Проверяем наличие whois
+        if ! command -v whois >/dev/null 2>&1; then
+            # Пытаемся установить whois автоматически только один раз
+            if [[ "$WHOIS_INSTALL_ATTEMPTED" == "false" ]]; then
+                WHOIS_INSTALL_ATTEMPTED=true
+                echo -e "${YELLOW}Устанавливаю whois...${NC}" >&2
+                
+                if command -v apt-get >/dev/null 2>&1; then
+                    if apt-get update >/dev/null 2>&1 && apt-get install -y whois >/dev/null 2>&1; then
+                        WHOIS_STATUS="installed"
+                    else
+                        WHOIS_STATUS="install_failed"
+                    fi
+                elif command -v yum >/dev/null 2>&1; then
+                    if yum install -y whois >/dev/null 2>&1; then
+                        WHOIS_STATUS="installed"
+                    else
+                        WHOIS_STATUS="install_failed"
+                    fi
+                elif command -v dnf >/dev/null 2>&1; then
+                    if dnf install -y whois >/dev/null 2>&1; then
+                        WHOIS_STATUS="installed"
+                    else
+                        WHOIS_STATUS="install_failed"
+                    fi
+                else
+                    WHOIS_STATUS="no_package_manager"
+                fi
+            fi
+        else
+            WHOIS_STATUS="available"
+        fi
+        
+        # Пытаемся получить информацию через whois
+        if command -v whois >/dev/null 2>&1 && [[ "$WHOIS_STATUS" != "install_failed" ]]; then
+            local country=$(timeout 5 whois "$ip" 2>/dev/null | grep -i "country:\|Country:" | head -1 | awk '{print $2}' | tr -d '\r')
+            local org=$(timeout 5 whois "$ip" 2>/dev/null | grep -i "org:\|organisation:\|OrgName:" | head -1 | sed 's/^[^:]*://g' | sed 's/^[ \t]*//g' | cut -c1-30 | tr -d '\r')
+            
+            if [[ -n "$country" && -n "$org" ]]; then
+                echo "[$country/$org]"
+                return
+            elif [[ -n "$country" ]]; then
+                echo "[$country]"
+                return
+            elif [[ -n "$org" ]]; then
+                echo "[$org]"
+                return
+            else
+                # whois не вернул данные
+                WHOIS_FAILED_COUNT=$((WHOIS_FAILED_COUNT + 1))
+                echo "[Unknown]"
+                return
+            fi
+        else
+            # whois недоступен
+            echo "[No data]"
+            return
+        fi
+    else
+        echo "[IPv6/Local]"
+    fi
+}
+
+# Показать статус whois в конце работы
+show_whois_status() {
+    echo -e "\n${BOLD}${WHITE}=========================================${NC}"
+    case "$WHOIS_STATUS" in
+        "available")
+            echo -e "${GREEN}✓ Геолокация IP: whois доступен, страны определяются${NC}"
+            ;;
+        "installed")
+            echo -e "${GREEN}✓ Геолокация IP: whois успешно установлен, страны определяются${NC}"
+            ;;
+        "install_failed")
+            echo -e "${YELLOW}⚠  Геолокация IP: не удалось установить whois (старая ОС/репозитории?)${NC}"
+            echo -e "${CYAN}   Для получения стран установите whois вручную${NC}"
+            ;;
+        "no_package_manager")
+            echo -e "${YELLOW}⚠  Геолокация IP: неизвестный пакетный менеджер${NC}"
+            echo -e "${CYAN}   Установите whois вручную для получения стран${NC}"
+            ;;
+        "unknown")
+            if [[ "$WHOIS_FAILED_COUNT" -gt 0 ]]; then
+                echo -e "${YELLOW}⚠  Геолокация IP: whois доступен, но $WHOIS_FAILED_COUNT IP не определились${NC}"
+            fi
+            ;;
+    esac
+    
+    if [[ "$WHOIS_STATUS" == "install_failed" || "$WHOIS_STATUS" == "no_package_manager" ]]; then
+        echo -e "${WHITE}   Команды для установки:${NC}"
+        echo -e "${CYAN}   Ubuntu/Debian: apt-get install whois${NC}"
+        echo -e "${CYAN}   CentOS/RHEL:   yum install whois${NC}"
+        echo -e "${CYAN}   Fedora:        dnf install whois${NC}"
+    fi
+    echo -e "${BOLD}${WHITE}=========================================${NC}"
+}
+
 # Основной анализ при запуске
 clear
-cat <<EOF
-${BOLD}${os_color}==============================
- DDoSer: Анализ подозрительной активности
- ОС: $os_name $os_version
- Панель: $CONTROL_PANEL
-==============================${NC}
-EOF
+printf "\033[1m\033[%sm==============================\n" "32"
+printf " DDoSer: Анализ подозрительной активности\n"
+printf " ОС: %s %s\n" "$os_name" "$os_version"
+printf " Панель: %s\n" "$CONTROL_PANEL"
+printf "==============================\033[0m\n"
 if [[ "$panel_login_url" != "" ]]; then
     echo -e "${CYAN}Ссылка для входа в панель: $panel_login_url${NC}"
 fi
@@ -230,23 +409,35 @@ fi
 analyze_logs
 analyze_connections
 show_load
+show_whois_status
 
-# Выводим меню для дальнейших действий
+# Меню для дальнейших действий
 while true; do
-    echo -e "\n${BOLD}${WHITE}Выберите действие:${NC}"
-    echo "1. Заблокировать IP"
-    echo "2. Сохранить отчёт"
-    echo "3. Показать ссылку на панель"
-    echo "4. Мониторинг в реальном времени"
-    echo "0. Выход"
-    read -p "Ваш выбор: " choice
+    echo -e "\n${BOLD}${WHITE}+------------------------------------------+${NC}"
+    echo -e "${BOLD}${WHITE}|              МЕНЮ ДЕЙСТВИЙ               |${NC}"
+    echo -e "${BOLD}${WHITE}+------------------------------------------+${NC}"
+    echo -e "${BOLD}${WHITE}| ${YELLOW}1${WHITE}. Заблокировать IP                    |${NC}"
+    echo -e "${BOLD}${WHITE}| ${CYAN}2${WHITE}. Сохранить отчёт                     |${NC}"
+    echo -e "${BOLD}${WHITE}| ${BLUE}3${WHITE}. Показать ссылку на панель           |${NC}"
+    echo -e "${BOLD}${WHITE}| ${MAGENTA}4${WHITE}. Мониторинг в реальном времени       |${NC}"
+    echo -e "${BOLD}${WHITE}| ${GREEN}5${WHITE}. Повторный анализ                    |${NC}"
+    echo -e "${BOLD}${WHITE}| ${RED}0${WHITE}. Выход                               |${NC}"
+    echo -e "${BOLD}${WHITE}+------------------------------------------+${NC}"
+    echo -ne "${BOLD}Ваш выбор: ${NC}"
+    read choice
     case $choice in
         1)
-            read -p "Введите IP для блокировки: " ip
-            block_ip "$ip"
+            echo -ne "${YELLOW}Введите IP для блокировки: ${NC}"
+            read ip
+            if [[ -n "$ip" ]]; then
+                block_ip "$ip"
+            else
+                echo -e "${RED}Ошибка: IP не указан!${NC}"
+            fi
             ;;
         2)
             save_report
+            echo -e "${GREEN}Отчёт сохранён в $LOG_FILE${NC}"
             ;;
         3)
             echo -e "${CYAN}Ссылка для входа в панель: $panel_login_url${NC}"
@@ -254,12 +445,19 @@ while true; do
         4)
             real_time_monitoring
             ;;
+        5)
+            echo -e "${YELLOW}Повторный анализ...${NC}"
+            analyze_logs
+            analyze_connections
+            show_load
+            show_whois_status
+            ;;
         0)
-            echo -e "${GREEN}Выход.${NC}"
+            echo -e "${GREEN}Спасибо за использование DDoSer! До свидания.${NC}"
             exit 0
             ;;
         *)
-            echo -e "${RED}Неверный выбор!${NC}"
+            echo -e "${RED}Неверный выбор! Пожалуйста, выберите от 0 до 5.${NC}"
             ;;
     esac
 done

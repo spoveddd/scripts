@@ -399,6 +399,10 @@ show_whois_status() {
 clear
 printf "\033[1m\033[%sm==============================\n" "32"
 printf " DDoSer: Анализ подозрительной активности\n"
+=======
+printf " DDoSer: DDoS Protection - Анализ логов на предмет атак\n"
+echo -e " ${CYAN}Создано Vladislav Pavlovich для технической поддержки. По вопросам в TG @sysadminctl${NC}"
+>>>>>>> c8346eb (add information)
 printf " ОС: %s %s\n" "$os_name" "$os_version"
 printf " Панель: %s\n" "$CONTROL_PANEL"
 printf "==============================\033[0m\n"

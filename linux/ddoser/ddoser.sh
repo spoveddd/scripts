@@ -230,6 +230,286 @@ block_ip() {
     log_action "Сгенерирована команда блокировки для $ip $ip_info"
 }
 
+# Блокировка IP (автоматическая)
+block_ip_auto() {
+    echo -e "\n${YELLOW}${BOLD}Топ IP по логам за сегодня:${NC}"
+    local ip_list=()
+    local counter=1
+    
+    # Читаем топ IP из временного файла
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            # Извлекаем IP из строки (формат: количество IP информация)
+            local ip=$(echo "$line" | awk '{print $2}')
+            if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                ip_list+=("$ip")
+                echo -e "${counter}. $line"
+                counter=$((counter + 1))
+            fi
+        fi
+    done < /tmp/ddoser_top_ip.log
+    
+    if [[ ${#ip_list[@]} -eq 0 ]]; then
+        echo -e "${RED}Не найдено IP для блокировки${NC}"
+        return
+    fi
+    
+    echo -ne "\n${YELLOW}Введите номера IP для блокировки (например: 1, 3, 5 или 1-3): ${NC}"
+    read ip_choices
+    
+    if [[ -z "$ip_choices" ]]; then
+        echo -e "${RED}Ошибка: Не выбраны IP для блокировки!${NC}"
+        return
+    fi
+    
+    # Парсим выбор пользователя
+    local selected_ips=()
+    IFS=','',' read -ra choices <<< "$ip_choices"
+    for choice in "${choices[@]}"; do
+        choice=$(echo "$choice" | tr -d ' ')
+        if [[ "$choice" =~ ^[0-9]+-[0-9]+$ ]]; then
+            # Диапазон
+            local start=$(echo "$choice" | cut -d'-' -f1)
+            local end=$(echo "$choice" | cut -d'-' -f2)
+            for ((i=start; i<=end; i++)); do
+                if [[ $i -ge 1 && $i -le ${#ip_list[@]} ]]; then
+                    selected_ips+=("${ip_list[$((i-1))]}")
+                fi
+            done
+        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+            # Одиночный выбор
+            if [[ $choice -ge 1 && $choice -le ${#ip_list[@]} ]]; then
+                selected_ips+=("${ip_list[$((choice-1))]}")
+            fi
+        fi
+    done
+    
+    # Блокируем выбранные IP
+    for ip in "${selected_ips[@]}"; do
+        echo -e "${CYAN}Блокирую IP: $ip${NC}"
+        iptables -I INPUT -s "$ip" -j DROP 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✓ IP $ip успешно заблокирован${NC}"
+            log_action "Заблокирован IP $ip"
+        else
+            echo -e "${RED}✗ Ошибка блокировки IP $ip${NC}"
+        fi
+    done
+}
+
+# Блокировка User-Agent
+block_user_agent() {
+    echo -e "\n${MAGENTA}${BOLD}Топ User-Agent за сегодня:${NC}"
+    local ua_list=()
+    local counter=1
+    
+    # Читаем топ User-Agent из временного файла и показываем в оригинальном формате
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            # Сохраняем всю строку для последующего использования
+            ua_list+=("$line")
+            # Показываем как в оригинале (количество + User-Agent)
+            echo -e "${counter}. $line"
+            counter=$((counter + 1))
+        fi
+    done < /tmp/ddoser_top_ua.log
+    
+    if [[ ${#ua_list[@]} -eq 0 ]]; then
+        echo -e "${RED}Не найдено User-Agent для блокировки${NC}"
+        return
+    fi
+    
+    echo -ne "\n${MAGENTA}Введите номера User-Agent для блокировки (например: 1, 3, 5 или 1-3): ${NC}"
+    read ua_choices
+    
+    if [[ -z "$ua_choices" ]]; then
+        echo -e "${RED}Ошибка: Не выбраны User-Agent для блокировки!${NC}"
+        return
+    fi
+    
+    # Парсим выбор пользователя
+    local selected_uas=()
+    IFS=',' read -ra choices <<< "$ua_choices"
+    for choice in "${choices[@]}"; do
+        choice=$(echo "$choice" | tr -d ' ')
+        if [[ "$choice" =~ ^[0-9]+-[0-9]+$ ]]; then
+            # Диапазон
+            local start=$(echo "$choice" | cut -d'-' -f1)
+            local end=$(echo "$choice" | cut -d'-' -f2)
+            for ((i=start; i<=end; i++)); do
+                if [[ $i -ge 1 && $i -le ${#ua_list[@]} ]]; then
+                    selected_uas+=("${ua_list[$((i-1))]}")
+                fi
+            done
+        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+            # Одиночный выбор
+            if [[ $choice -ge 1 && $choice -le ${#ua_list[@]} ]]; then
+                selected_uas+=("${ua_list[$((choice-1))]}")
+            fi
+        fi
+    done
+    
+    if [[ ${#selected_uas[@]} -eq 0 ]]; then
+        echo -e "${RED}Ошибка: Не выбраны корректные User-Agent для блокировки!${NC}"
+        return
+    fi
+    
+    # Извлекаем только User-Agent из выбранных строк (убираем количество в начале)
+    local clean_uas=()
+    for ua_line in "${selected_uas[@]}"; do
+        # Извлекаем User-Agent из строки формата: "количество User-Agent"
+        # Удаляем ведущие пробелы и цифры в начале строки
+        local clean_ua=$(echo "$ua_line" | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]*//')
+        clean_uas+=("$clean_ua")
+    done
+    
+    # Определяем путь для конфигурации в зависимости от панели управления
+    local config_path=""
+    local config_file=""
+    case "$CONTROL_PANEL" in
+        fastpanel)
+            config_path="/etc/nginx/fastpanel2-includes"
+            config_file="blockua.conf"
+            ;;
+        ispmanager)
+            config_path="/etc/nginx/vhosts-includes"
+            config_file="blockua.conf"
+            ;;
+        hestia)
+            # Для Hestia создаем файлы в домашних директориях пользователей
+            echo -e "${CYAN}Создаю конфигурационные файлы для Hestia...${NC}"
+            local hestia_count=0
+            
+            # Находим все файлы nginx.ssl.conf
+            while IFS= read -r -d '' file; do
+                if [[ -f "$file" ]]; then
+                    local badbot_file="${file}_badbot"
+                    
+                    # Создаем или обновляем файл _badbot
+                    if [[ -f "$badbot_file" ]]; then
+                        echo -e "${YELLOW}Файл $badbot_file уже существует. Добавляю новые правила.${NC}"
+                        # Добавляем маркер начала новых правил
+                        echo "" >> "$badbot_file"
+                        echo "# Добавлены правила $(date)" >> "$badbot_file"
+                    else
+                        echo -e "${CYAN}Создаю новый файл: $badbot_file${NC}"
+                        # Создаем новый файл с заголовком
+                        {
+                            echo "# Блокировка User-Agent (сгенерировано DDoSer)"
+                            echo "# Дата: $(date)"
+                        } > "$badbot_file"
+                    fi
+                    
+                    # Добавляем правила блокировки
+                    for ua in "${clean_uas[@]}"; do
+                        # Экранируем специальные символы в User-Agent
+                        local escaped_ua=$(echo "$ua" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                        echo "if (\$http_user_agent ~ \"^${escaped_ua}$\") { return 444; }" >> "$badbot_file"
+                    done
+                    
+                    hestia_count=$((hestia_count + 1))
+                fi
+            done < <(find /home -type f -name "nginx.ssl.conf" -print0 2>/dev/null)
+            
+            if [[ $hestia_count -eq 0 ]]; then
+                echo -e "${RED}Не найдено файлов nginx.ssl.conf для Hestia${NC}"
+                return
+            else
+                echo -e "${GREEN}✓ Обработано доменов Hestia: $hestia_count${NC}"
+                
+                # Перезагружаем nginx
+                echo -e "${CYAN}Перезагружаю nginx...${NC}"
+                if systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null; then
+                    echo -e "${GREEN}✓ Nginx успешно перезагружен${NC}"
+                    echo -e "${GREEN}✓ Добавлены User-Agent: ${#clean_uas[@]} шт. для $hestia_count доменов${NC}"
+                    log_action "Добавлены User-Agent: ${#clean_uas[@]} шт. для $hestia_count доменов (Hestia)"
+                else
+                    echo -e "${RED}✗ Ошибка перезагрузки nginx${NC}"
+                fi
+            fi
+            return
+            ;;
+        *)
+            echo -e "${RED}Блокировка User-Agent поддерживается только для FastPanel, ISPmanager и Hestia${NC}"
+            return
+            ;;
+    esac
+    
+    # Создаем конфигурационный файл для FastPanel и ISPmanager
+    local full_path="$config_path/$config_file"
+    echo -e "${CYAN}Работаю с конфигурационным файлом: $full_path${NC}"
+    
+    # Создаем директорию если она не существует
+    mkdir -p "$config_path" 2>/dev/null
+    
+    # Проверяем, существует ли файл
+    if [[ -f "$full_path" ]]; then
+        echo -e "${YELLOW}Файл уже существует. Добавляю новые правила в конец файла.${NC}"
+        # Создаем временный файл с новыми правилами
+        local tmp_file="/tmp/blockua_new.rules"
+        {
+            echo ""
+            echo "# Добавлены правила $(date)"
+            echo ""
+            
+            # Добавляем новые правила
+            for ua in "${clean_uas[@]}"; do
+                # Экранируем специальные символы в User-Agent
+                local escaped_ua=$(echo "$ua" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                echo "if (\$http_user_agent ~ \"^${escaped_ua}$\") {"
+                echo "    return 403;"
+                echo "}"
+            done
+        } > "$tmp_file"
+        
+        # Добавляем новые правила в существующий файл
+        cat "$tmp_file" >> "$full_path"
+        rm -f "$tmp_file"
+    else
+        echo -e "${CYAN}Создаю новый конфигурационный файл: $full_path${NC}"
+        # Создаем новый файл с заголовком и правилами
+        {
+            echo "# Блокировка User-Agent (сгенерировано DDoSer)"
+            echo "# Дата: $(date)"
+            echo ""
+            
+            # Добавляем правила
+            for ua in "${clean_uas[@]}"; do
+                # Экранируем специальные символы в User-Agent
+                local escaped_ua=$(echo "$ua" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                echo "if (\$http_user_agent ~ \"^${escaped_ua}$\") {"
+                echo "    return 403;"
+                echo "}"
+            done
+        } > "$full_path"
+    fi
+    
+    # Проверяем конфигурацию nginx
+    echo -e "${CYAN}Проверяю конфигурацию nginx...${NC}"
+    if nginx -t 2>/dev/null; then
+        echo -e "${GREEN}✓ Конфигурация nginx корректна${NC}"
+        
+        # Перезагружаем nginx
+        echo -e "${CYAN}Перезагружаю nginx...${NC}"
+        if systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null; then
+            echo -e "${GREEN}✓ Nginx успешно перезагружен${NC}"
+            echo -e "${GREEN}✓ Добавлены User-Agent: ${#clean_uas[@]} шт.${NC}"
+            log_action "Добавлены User-Agent: ${#clean_uas[@]} шт."
+        else
+            echo -e "${RED}✗ Ошибка перезагрузки nginx${NC}"
+        fi
+    else
+        echo -e "${RED}✗ Ошибка в конфигурации nginx. Отмена.${NC}"
+        # Показываем содержимое файла для отладки
+        echo -e "${YELLOW}Содержимое конфигурационного файла:${NC}"
+        cat "$full_path"
+        # Если файл новый, удаляем его в случае ошибки
+        if [[ ! -f "$full_path.backup" ]]; then
+            rm -f "$full_path"
+        fi
+    fi
+}
+
 # Сохранить действия
 save_report() {
     local now="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -418,35 +698,33 @@ while true; do
     echo -e "${BOLD}${WHITE}|              МЕНЮ ДЕЙСТВИЙ               |${NC}"
     echo -e "${BOLD}${WHITE}+------------------------------------------+${NC}"
     echo -e "${BOLD}${WHITE}| ${YELLOW}1${WHITE}. Заблокировать IP                    |${NC}"
-    echo -e "${BOLD}${WHITE}| ${CYAN}2${WHITE}. Сохранить отчёт                     |${NC}"
-    echo -e "${BOLD}${WHITE}| ${BLUE}3${WHITE}. Показать ссылку на панель           |${NC}"
-    echo -e "${BOLD}${WHITE}| ${MAGENTA}4${WHITE}. Мониторинг в реальном времени       |${NC}"
-    echo -e "${BOLD}${WHITE}| ${GREEN}5${WHITE}. Повторный анализ                    |${NC}"
+    echo -e "${BOLD}${WHITE}| ${MAGENTA}2${WHITE}. Заблокировать UA                    |${NC}"
+    echo -e "${BOLD}${WHITE}| ${CYAN}3${WHITE}. Сохранить отчёт                     |${NC}"
+    echo -e "${BOLD}${WHITE}| ${BLUE}4${WHITE}. Показать ссылку на панель           |${NC}"
+    echo -e "${BOLD}${WHITE}| ${MAGENTA}5${WHITE}. Мониторинг в реальном времени       |${NC}"
+    echo -e "${BOLD}${WHITE}| ${GREEN}6${WHITE}. Повторный анализ                    |${NC}"
     echo -e "${BOLD}${WHITE}| ${RED}0${WHITE}. Выход                               |${NC}"
     echo -e "${BOLD}${WHITE}+------------------------------------------+${NC}"
     echo -ne "${BOLD}Ваш выбор: ${NC}"
     read choice
     case $choice in
         1)
-            echo -ne "${YELLOW}Введите IP для блокировки: ${NC}"
-            read ip
-            if [[ -n "$ip" ]]; then
-                block_ip "$ip"
-            else
-                echo -e "${RED}Ошибка: IP не указан!${NC}"
-            fi
+            block_ip_auto
             ;;
         2)
+            block_user_agent
+            ;;
+        3)
             save_report
             echo -e "${GREEN}Отчёт сохранён в $LOG_FILE${NC}"
             ;;
-        3)
+        4)
             echo -e "${CYAN}Ссылка для входа в панель: $panel_login_url${NC}"
             ;;
-        4)
+        5)
             real_time_monitoring
             ;;
-        5)
+        6)
             echo -e "${YELLOW}Повторный анализ...${NC}"
             analyze_logs
             analyze_connections
@@ -458,7 +736,7 @@ while true; do
             exit 0
             ;;
         *)
-            echo -e "${RED}Неверный выбор! Пожалуйста, выберите от 0 до 5.${NC}"
+            echo -e "${RED}Неверный выбор! Пожалуйста, выберите от 0 до 6.${NC}"
             ;;
     esac
 done

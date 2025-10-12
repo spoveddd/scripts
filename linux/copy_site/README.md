@@ -1,16 +1,16 @@
 # Site Copy Script
 
-Автоматическое копирование сайтов с CMS (WordPress, DLE) включая БД, файлы и SSL сертификаты.
+Автоматическое копирование сайтов с CMS (WordPress, DLE) включая БД, файлы и выпуск SSL сертификатов.
 
-**Поддержка:** FastPanel, ISPManager, Hestia
+**Поддержка:** Наиболее популярные панели управления: FastPanel, ISPManager и Hestia. 
 
-## Быстрый старт
+## Быстрый старт:
 
 ```bash
 sudo bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh)
 ```
 
-или
+или классический вариант:
 
 ```bash
 wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
@@ -18,21 +18,21 @@ chmod +x copy_site.sh
 sudo ./copy_site.sh
 ```
 
-## Что делает
+## Что делает скрипт?
 
-- Определяет панель управления автоматически
-- Создает новый сайт и БД через CLI панели
-- Копирует файлы исходного сайта
+- Автоматически определяет панель управления 
+- Создает новый сайт и БД через CLI панели (либо определяет, что он создан)
+- Копирует файлы исходного сайта в директорию целевого
 - Импортирует БД с сохранением данных
-- Обновляет конфигурацию (WordPress/DLE)
-- Выпускает SSL Let's Encrypt сертификат
-- Логирует все операции в `/var/log/site_copy_script_*.log`
+- Обновляет конфигурацию (только для CMS WordPress/DLE)
+- Выпускает SSL Let's Encrypt сертификат (если есть DNS-записи)
+- Скрипт логирует все операции в `/var/log/site_copy_script_*.log`
 
 ## Требования
 
-- Linux (Debian-based)
-- root доступ
-- MySQL/MariaDB запущена
+- OS Linux (Debian-based, RHEL)
+- root-доступ
+- запущенная MySQL/MariaDB
 - Зависимости: `rsync`, `mysql`, `mysqldump`, `sed`, `grep`, `find`
 
 ## Как работает
@@ -40,7 +40,7 @@ sudo ./copy_site.sh
 1. Введите домен исходного сайта
 2. Введите домен нового сайта
 3. Подтвердите параметры БД
-4. Скрипт сам всё остальное сделает
+4. Остальное скрипт делает автоматически и предоставляет подробные действия 
 
 ## Структура панелей
 

@@ -7,7 +7,7 @@
 ## Быстрый старт:
 
 ```bash
-sudo bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh)
+bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh)
 ```
 
 или классический вариант:
@@ -15,7 +15,7 @@ sudo bash <(curl -s https://raw.githubusercontent.com/spoveddd/scripts/main/linu
 ```bash
 wget https://raw.githubusercontent.com/spoveddd/scripts/main/linux/copy_site/copy_site.sh
 chmod +x copy_site.sh
-sudo ./copy_site.sh
+./copy_site.sh
 ```
 
 ## Что делает скрипт?

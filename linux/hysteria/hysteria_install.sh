@@ -50,7 +50,7 @@ create_config() {
     
     print_status "Создание конфигурации..."
     cat > "$CONFIG_PATH" << EOF
-listen: :443
+listen: 0.0.0.0:443
 
 tls:
   cert: $CERT_PATH
@@ -130,7 +130,7 @@ verify_installation() {
 show_connection_info() {
     local password="$1"
     local server_ip
-    server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    server_ip=$(curl -4 -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
     
     echo ""
     echo "=========================================="

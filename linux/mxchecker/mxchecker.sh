@@ -50,6 +50,11 @@ PORT587_OPEN=0
 TLS_ANY_OK=0
 TLS_ANY_PROBLEM=0
 
+# SMTP баннер / hostname (для итогов)
+SMTP_HOSTNAME=""
+SMTP_HOSTNAME_IP=""
+PTR_OF_MX=""
+
 
 # логирование
 LOG_FILE="/var/log/mxchecker_script.log"
@@ -276,11 +281,15 @@ check_mx_and_ptr() {
                 ptr=$(host "$ip" "$DNS_SERVER" 2>/dev/null | awk '/domain name pointer/ {print $5}' | sed 's/\.$//')
             fi
             if [[ -n "$ptr" ]]; then
-                if [[ "$ptr" == "$mx" ]]; then
-                    ok "   PTR: $ptr (совпадает с MX)"
+                local ptr_a
+                ptr_a=$(dns_query "$ptr" A)
+                if echo "$ptr_a" | grep -qF "$ip"; then
+                    ok "   PTR: $ptr → $ip (forward-confirmed ✓)"
+                    [[ -z "$PTR_OF_MX" ]] && PTR_OF_MX="$ptr"
                 else
                     MX_PTR_MISMATCH=1
-                    warn "   PTR: $ptr (НЕ совпадает с MX: $mx)"
+                    warn "   PTR: $ptr — forward-confirm не прошёл (A-запись PTR не ведёт на $ip)"
+                    echo "      Это может быть нормально для shared-сервера — проверьте вручную."
                 fi
             else
                 PTR_MISSING=1
@@ -493,6 +502,7 @@ check_smtp_ports() {
 
         local open_ports=()
         local closed_ports=()
+        local port25_open_for_ip=0
 
         for port in 25 465 587; do
             local port_open=0
@@ -509,7 +519,10 @@ check_smtp_ports() {
             if [[ "$port_open" -eq 1 ]]; then
                 open_ports+=("$port")
                 case "$port" in
-                    25) PORT25_OPEN=1 ;;
+                    25)
+                        PORT25_OPEN=1
+                        port25_open_for_ip=1
+                        ;;
                     465) PORT465_OPEN=1 ;;
                     587) PORT587_OPEN=1 ;;
                 esac
@@ -524,6 +537,27 @@ check_smtp_ports() {
             warn "   Открыты порты: ${open_ports[*]}; закрыты или недоступны: ${closed_ports[*]}."
         else
             fail "   Все проверенные почтовые порты закрыты или недоступны (25, 465, 587)."
+        fi
+
+        # SMTP баннер читаем только если 25 открыт для этого IP
+        if [[ "$port25_open_for_ip" -eq 1 && "$HAS_NC" -eq 1 ]]; then
+            local banner=""
+            if command -v nc >/dev/null 2>&1; then
+                banner=$(echo QUIT | timeout 5 nc -w3 "$ip" 25 2>/dev/null | head -1)
+            elif command -v ncat >/dev/null 2>&1; then
+                banner=$(echo QUIT | timeout 5 ncat -w3 "$ip" 25 2>/dev/null | head -1)
+            elif command -v netcat >/dev/null 2>&1; then
+                banner=$(echo QUIT | timeout 5 netcat -w3 "$ip" 25 2>/dev/null | head -1)
+            fi
+            local smtp_hostname
+            smtp_hostname=$(echo "$banner" | awk '{print $2}')
+            if [[ -n "$smtp_hostname" ]]; then
+                echo "   SMTP hostname (из баннера): $smtp_hostname"
+                if [[ -z "$SMTP_HOSTNAME" ]]; then
+                    SMTP_HOSTNAME="$smtp_hostname"
+                    SMTP_HOSTNAME_IP="$ip"
+                fi
+            fi
         fi
 
         echo
@@ -639,172 +673,145 @@ print_summary() {
     local critical_issues=0
     local warning_issues=0
 
-    if [[ "$HAS_MX" -eq 0 && "$DNS_A_FOUND" -eq 0 ]]; then
-        critical_issues=1
-    fi
-
-    # SPF и DMARC — критично
-    if [[ "$HAS_SPF" -eq 0 || "$SPF_PLUS_ALL" -eq 1 ]]; then
-        critical_issues=1
-    fi
-    if [[ "$DMARC_FOUND" -eq 0 ]]; then
-        critical_issues=1
-    fi
-
-    # DKIM — сначала как предупреждение (нестандартный селектор возможен)
-    if [[ "$DKIM_FOUND" -eq 0 ]]; then
-        warning_issues=1
-    fi
-
-    # SPF с +all или без явного окончания уже учтён в текстах выше, но можно считать это предупреждением
-    # DNSBL — критично
-    if [[ "$DNSBL_LISTED" -eq 1 ]]; then
-        critical_issues=1
-    fi
-
-    # Порты SMTP только если есть MX
-    if [[ "$HAS_MX" -eq 1 && "$PORT25_OPEN" -eq 0 && "$PORT587_OPEN" -eq 0 && "$PORT465_OPEN" -eq 0 ]]; then
-        critical_issues=1
-    fi
-
-    # TLS: если везде проблемы и нет ни одного успешного соединения
-    if [[ "${#MX_IPS[@]}" -gt 0 && "$TLS_ANY_PROBLEM" -eq 1 && "$TLS_ANY_OK" -eq 0 ]]; then
-        critical_issues=1
-    elif [[ "${#MX_IPS[@]}" -gt 0 && "$TLS_ANY_OK" -eq 1 && "$TLS_ANY_PROBLEM" -eq 1 ]]; then
-        warning_issues=1
-    fi
+    [[ "$HAS_MX" -eq 0 && "$DNS_A_FOUND" -eq 0 ]] && critical_issues=1
+    [[ "$HAS_SPF" -eq 0 || "$SPF_PLUS_ALL" -eq 1 ]] && critical_issues=1
+    [[ "$DMARC_FOUND" -eq 0 ]] && critical_issues=1
+    [[ "$DKIM_FOUND" -eq 0 ]] && warning_issues=1
+    [[ "$DNSBL_LISTED" -eq 1 ]] && critical_issues=1
+    [[ "$HAS_MX" -eq 1 && "$PORT25_OPEN" -eq 0 && "$PORT587_OPEN" -eq 0 && "$PORT465_OPEN" -eq 0 ]] && critical_issues=1
+    [[ "${#MX_IPS[@]}" -gt 0 && "$TLS_ANY_PROBLEM" -eq 1 && "$TLS_ANY_OK" -eq 0 ]] && critical_issues=1
+    [[ "${#MX_IPS[@]}" -gt 0 && "$TLS_ANY_OK" -eq 1 && "$TLS_ANY_PROBLEM" -eq 1 ]] && warning_issues=1
 
     if [[ "$critical_issues" -eq 0 && "$warning_issues" -eq 0 ]]; then
-        echo "Общая оценка: отправка и приём почты должны работать корректно."
+        ok "Общая оценка: отправка и приём почты работают корректно."
     elif [[ "$critical_issues" -eq 0 && "$warning_issues" -eq 1 ]]; then
-        echo "Общая оценка: базовая конфигурация в порядке, но есть рекомендации ниже."
+        warn "Общая оценка: базовая конфигурация в порядке, но есть рекомендации."
     elif [[ "$critical_issues" -eq 1 && "$warning_issues" -eq 0 ]]; then
-        echo "Общая оценка: есть критичные моменты, влияющие на доставку — см. детали ниже."
+        fail "Общая оценка: есть критичные проблемы, влияющие на доставку."
     else
-        echo "Общая оценка: есть критичные и предупреждающие проблемы — рекомендуется детально проработать настройки ниже."
+        fail "Общая оценка: есть критичные проблемы."
     fi
 
     echo
-    echo "- Общий статус:"
+    echo -e "${BOLD}DNS и маршрутизация:${NC}"
     if [[ "$HAS_MX" -eq 1 ]]; then
-        echo "  * MX-записи найдены."
+        ok "MX-записи найдены."
+        if [[ -n "$SMTP_HOSTNAME" ]]; then
+            if [[ "$PTR_OF_MX" == "$SMTP_HOSTNAME" && -n "$PTR_OF_MX" ]]; then
+                ok "PTR совпадает с SMTP hostname сервера ($SMTP_HOSTNAME) — конфигурация корректна."
+            elif [[ -n "$PTR_OF_MX" ]]; then
+                warn "PTR ($PTR_OF_MX) не совпадает с SMTP hostname ($SMTP_HOSTNAME)."
+                echo "      Рекомендуется привести PTR к виду SMTP hostname для лучшей репутации."
+            else
+                warn "PTR не прошёл forward-confirm или отсутствует. SMTP hostname: $SMTP_HOSTNAME."
+            fi
+        fi
         if [[ "$MX_PTR_MISMATCH" -eq 1 ]]; then
-            echo "    ! Есть MX, у которых PTR не совпадает — лучше привести PTR к виду mx-хоста."
-            echo "      Решение: у хостинг-провайдера сервера запросите изменение PTR на FQDN MX-сервера."
+            warn "PTR не совпадает с MX — возможно это нормально для shared-сервера, но стоит проверить."
+            echo "      Решение: убедитесь что PTR forward-confirmed (A-запись PTR-хоста указывает на тот же IP)."
+            echo "      Или обратитесь к хостинг-провайдеру для изменения PTR."
         fi
         if [[ "$PTR_MISSING" -eq 1 ]]; then
-            echo "    ! Для части IP MX PTR-запись отсутствует — желательно настроить PTR на FQDN почтового сервера."
-            echo "      Решение: обратитесь к хостинг-провайдеру, выдавшему IP-адрес MX-сервера, и попросите настроить обратную DNS-запись (PTR) вида: IP → ${domain}."
+            warn "PTR-запись отсутствует для части IP MX."
+            echo "      Решение: обратитесь к хостинг-провайдеру для настройки PTR."
         fi
     else
-        echo "  * MX-записи отсутствуют — почта, вероятно, идёт напрямую на A-запись или домен не принимает почту."
+        warn "MX-записи отсутствуют — почта идёт напрямую на A-запись или домен не принимает почту."
     fi
 
     echo
-    echo "- Аутентификация отправителя:"
+    echo -e "${BOLD}Аутентификация отправителя:${NC}"
     if [[ "$HAS_SPF" -eq 1 ]]; then
         case "$SPF_STRICT" in
-            2)
-                echo "  * SPF: настроен с жёсткой политикой (-all) — максимально надёжно."
-                ;;
-            1)
-                echo "  * SPF: настроен с ~all (softfail) — хорошо, но можно усилить до -all."
-                ;;
+            2) ok "SPF: жёсткая политика (-all) — максимально надёжно." ;;
+            1) warn "SPF: ~all (softfail) — хорошо, но можно усилить до -all." ;;
             0)
                 if [[ "$SPF_PLUS_ALL" -eq 1 ]]; then
-                    echo "  * SPF: содержит +all — КРИТИЧНО: разрешает отправку с любого сервера в мире."
-                    echo "    Решение: удалите +all и добавьте в конец записи -all или ~all, предварительно перечислив легитимные источники (ip4:/ip6:/include:)."
+                    fail "SPF: +all — КРИТИЧНО: разрешает отправку с любого сервера в мире."
+                    echo "      Решение: замените +all на -all и перечислите легитимные источники."
                 else
-                    echo "  * SPF: нет явного окончания (~all/-all) — политика для неизвестных источников не определена."
-                    echo "    Решение: добавьте в конец записи -all (или временно ~all) для ограничения отправителей."
+                    warn "SPF: нет явного окончания (~all/-all) — политика не определена."
+                    echo "      Решение: добавьте -all в конец SPF-записи."
                 fi
                 ;;
         esac
     else
-        echo "  * SPF: не найден — HIGH PRIORITY: настроить SPF, чтобы ограничить подделку домена."
-        echo "    Решение: добавьте TXT-запись для домена, например:"
-        echo "    v=spf1 mx -all"
-        echo "    или включите нужные ip4:/ip6:/include: перед -all."
+        fail "SPF: не найден — HIGH PRIORITY."
+        echo "      Решение: добавьте TXT-запись: v=spf1 mx -all"
     fi
 
     if [[ "$DKIM_FOUND" -eq 1 ]]; then
-        echo "  * DKIM: найден (селекторы: $DKIM_SELECTORS)."
+        ok "DKIM: найден (селекторы: $DKIM_SELECTORS)."
     else
-        echo "  * DKIM: не найден по типичным селекторам — HIGH PRIORITY: включить DKIM на почтовом сервере (или проверить нестандартный селектор)."
-        echo "    Решение: включите DKIM и добавьте TXT-запись вида:"
-        echo "    <selector>._domainkey.${domain}  TXT  \"v=DKIM1; k=rsa; p=<публичный ключ>\""
+        warn "DKIM: не найден по типичным селекторам."
+        echo "      Возможно используется нестандартный селектор — уточните у провайдера."
+        echo "      Если DKIM не настроен: добавьте TXT-запись <selector>._domainkey.${domain}"
     fi
 
     if [[ "$DMARC_FOUND" -eq 1 ]]; then
         if [[ "$DMARC_POLICY_STRICT" -eq 1 ]]; then
-            echo "  * DMARC: включён с жёсткой политикой (p=${DMARC_POLICY})."
-            if [[ -z "$DMARC_SP" ]]; then
-                echo "    * Субдомены наследуют политику p=${DMARC_POLICY} (sp= не задан явно)."
-            fi
+            ok "DMARC: жёсткая политика (p=${DMARC_POLICY})."
+            [[ -z "$DMARC_SP" ]] && echo "      Субдомены наследуют p=${DMARC_POLICY}."
         else
-            echo "  * DMARC: включён с мягкой политикой (p=${DMARC_POLICY:-none}) — можно постепенно ужесточать до quarantine/reject."
+            warn "DMARC: мягкая политика (p=${DMARC_POLICY:-none}) — можно ужесточить до quarantine/reject."
+        fi
+        if [[ -n "$DMARC_SP" ]]; then
+            echo "      Политика для субдоменов: sp=${DMARC_SP}."
+            if [[ "${DMARC_SP,,}" == "none" && "$DMARC_POLICY_STRICT" -eq 1 ]]; then
+                warn "DMARC: sp=none — субдомены не защищены несмотря на строгий p=${DMARC_POLICY}."
+                echo "      Решение: измените sp=none на sp=reject или удалите sp=."
+            fi
         fi
     else
-        echo "  * DMARC: отсутствует — HIGH PRIORITY: добавить DMARC для защиты домена."
-        echo "    Решение: добавьте TXT-запись _dmarc.${domain}, например для начала:"
-        echo "    v=DMARC1; p=none; rua=mailto:dmarc@${domain}"
-        echo "    После мониторинга можно перейти на p=quarantine или p=reject."
-    fi
-
-    # Дополнительная информация по sp=, если задан
-    if [[ "$DMARC_FOUND" -eq 1 && -n "$DMARC_SP" ]]; then
-        echo "    * Политика для субдоменов: sp=${DMARC_SP}."
-        if [[ "${DMARC_SP,,}" == "none" && "$DMARC_POLICY_STRICT" -eq 1 ]]; then
-            echo "      ! Субдомены не защищены несмотря на строгий p=${DMARC_POLICY}."
-            echo "      Решение: измените sp=none на sp=reject/quarantine или удалите sp= для наследования политики p=."
-        fi
+        fail "DMARC: отсутствует — HIGH PRIORITY."
+        echo "      Решение: добавьте TXT-запись _dmarc.${domain}:"
+        echo "      v=DMARC1; p=none; rua=mailto:dmarc@${domain}"
+        echo "      После мониторинга переходите на p=quarantine или p=reject."
     fi
 
     echo
-    echo "- Transport security:"
+    echo -e "${BOLD}Transport security:${NC}"
     if [[ "$HAS_MTA_STS" -eq 1 ]]; then
-        echo "  * MTA-STS: есть — защита от StartTLS-downgrade реализована."
+        ok "MTA-STS: настроен — защита от StartTLS-downgrade есть."
     else
-        echo "  * MTA-STS: отсутствует — рекомендация: внедрить MTA-STS с режимом enforce после тестов."
-        echo "    Решение: разместите политику по адресу https://mta-sts.${domain}/.well-known/mta-sts.txt"
-        echo "    и добавьте TXT-запись _mta-sts.${domain}: \"v=STSv1; id=<уникальный идентификатор>\"."
+        warn "MTA-STS: отсутствует."
+        echo "      Решение: разместите политику на https://mta-sts.${domain}/.well-known/mta-sts.txt"
+        echo "      и добавьте TXT _mta-sts.${domain}: \"v=STSv1; id=<id>\"."
     fi
 
     if [[ "$HAS_OPENSSL" -eq 0 ]]; then
-        echo "  * TLS/StartTLS: openssl не найден, проверка сертификатов не выполнялась."
+        warn "TLS/StartTLS: openssl не найден, проверка не выполнялась."
     elif [[ "${#MX_IPS[@]}" -eq 0 ]]; then
-        echo "  * TLS/StartTLS: нет IP MX-хостов, проверка сертификатов не выполнялась."
+        warn "TLS/StartTLS: нет IP MX-хостов, проверка не выполнялась."
+    elif [[ "$TLS_ANY_OK" -eq 1 && "$TLS_ANY_PROBLEM" -eq 0 ]]; then
+        ok "TLS/StartTLS: сертификаты валидны на всех портах."
+    elif [[ "$TLS_ANY_OK" -eq 1 && "$TLS_ANY_PROBLEM" -eq 1 ]]; then
+        warn "TLS/StartTLS: сертификаты валидны частично — есть порты с проблемами."
+    elif [[ "$TLS_ANY_PROBLEM" -eq 1 ]]; then
+        fail "TLS/StartTLS: проблемы с сертификатами на всех портах — HIGH PRIORITY."
     else
-        if [[ "$TLS_ANY_OK" -eq 1 && "$TLS_ANY_PROBLEM" -eq 0 ]]; then
-            echo "  * TLS/StartTLS: сертификаты валидны на всех проверенных портах."
-        elif [[ "$TLS_ANY_OK" -eq 1 && "$TLS_ANY_PROBLEM" -eq 1 ]]; then
-            echo "  * TLS/StartTLS: сертификаты валидны частично — есть порты с проблемами."
-        elif [[ "$TLS_ANY_PROBLEM" -eq 1 ]]; then
-            echo "  * TLS/StartTLS: проблемы с сертификатами на всех проверенных портах — HIGH PRIORITY."
-        else
-            echo "  * TLS/StartTLS: все SMTP-порты недоступны, проверка сертификатов не проводилась."
-        fi
+        warn "TLS/StartTLS: все SMTP-порты недоступны, проверка не проводилась."
     fi
 
     if [[ "$DNSBL_LISTED" -eq 1 ]]; then
-        echo "  * DNSBL: есть попадания в чёрные списки — критично, разберите и запросите делистинг."
-        echo "    Решение: проверьте IP на сайте соответствующего списка и следуйте процедуре делистинга (удаления из списка)."
+        fail "DNSBL: IP найден в чёрных списках — КРИТИЧНО."
+        echo "      Решение: найдите причину и запросите делистинг на сайте соответствующего списка."
     else
-        echo "  * DNSBL: в проверяемых списках попаданий не обнаружено."
+        ok "DNSBL: в проверяемых списках не обнаружено."
     fi
 
     echo
-    echo "- SMTP-порты:"
+    echo -e "${BOLD}SMTP-порты:${NC}"
     if [[ "$HAS_MX" -eq 0 ]]; then
-        echo "  * Проверка портов не применима — MX-записи отсутствуют."
+        warn "Проверка портов не применима — MX-записи отсутствуют."
     elif [[ "$PORT25_OPEN" -eq 1 || "$PORT465_OPEN" -eq 1 || "$PORT587_OPEN" -eq 1 ]]; then
         local open_list=()
         [[ "$PORT25_OPEN" -eq 1 ]] && open_list+=("25")
         [[ "$PORT465_OPEN" -eq 1 ]] && open_list+=("465")
         [[ "$PORT587_OPEN" -eq 1 ]] && open_list+=("587")
-        echo "  * Открыты почтовые порты: ${open_list[*]}."
+        ok "Открыты почтовые порты: ${open_list[*]}."
     else
-        echo "  * Все стандартные почтовые порты (25, 465, 587) выглядят недоступными — приём почты под вопросом."
+        fail "Все стандартные порты (25, 465, 587) недоступны — приём почты под вопросом."
     fi
 
     echo

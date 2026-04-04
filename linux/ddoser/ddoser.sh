@@ -472,13 +472,11 @@ collect_log_files() {
         [[ -f "$f" ]] && [[ -s "$f" ]] && LOG_FILES+=( "$f" )
     done
 
-    # Ротированные логи (.log.1) при периоде >= 24h
-    if [[ $PERIOD_HOURS -ge 24 ]]; then
-        for f in "${patterns[@]}"; do
-            local rotated="${f}.1"
-            [[ -f "$rotated" ]] && [[ -s "$rotated" ]] && LOG_FILES+=( "$rotated" )
-        done
-    fi
+    # Ротированные логи (.log.1) — подключаем всегда для полноты
+    for f in "${patterns[@]}"; do
+        local rotated="${f}.1"
+        [[ -f "$rotated" ]] && [[ -s "$rotated" ]] && LOG_FILES+=( "$rotated" )
+    done
 
     SITE_COUNT=${#LOG_FILES[@]}
 }
@@ -687,6 +685,16 @@ classify_client() {
         return
     fi
 
+    # WordPress (не бот, но специфический клиент)
+    if echo "$main_ua" | grep -qi "wordpress"; then
+        if (( ua_count > 1 )); then
+            echo "WordPress (${ua_count} UA)"
+        else
+            echo "WordPress"
+        fi
+        return
+    fi
+
     # Proxy (100+ разных UA)
     if (( ua_count >= 100 )); then
         echo "proxy (${ua_count} UA)"
@@ -754,10 +762,26 @@ dns_check_site() {
     elif [[ "$a_record" == "$SERVER_IP" ]]; then
         tag="→SRV"
     else
-        # Проверяем CDN
-        local cname
-        cname=$(_timeout 2 dig +short "$domain" CNAME 2>/dev/null | head -1)
-        if echo "$cname" | grep -qi "cloudflare\|akamai\|fastly\|cdn\|ddos-guard\|cloudfront\|sucuri"; then
+        # Проверяем CDN: сначала по IP (Cloudflare, etc.), потом по CNAME
+        local is_cdn=false
+
+        # Cloudflare IP ranges: 104.16-23.x.x, 172.64-71.x.x, 162.158-159.x.x,
+        # 141.101.x.x, 108.162.x.x, 173.245.x.x, 188.114.x.x, 190.93.x.x, 131.0.72.x
+        if echo "$a_record" | grep -qE '^(104\.(1[6-9]|2[0-3])|172\.(6[4-9]|7[01])|162\.15[89]|141\.101|108\.162|173\.245|188\.114|190\.93|131\.0\.7[2-5]|198\.41\.1[2-9][0-9]|103\.(21\.24|22\.20|31\.[4-7]))\.'; then
+            is_cdn=true
+            ns_provider="Cloudflare"
+        fi
+
+        # DDos-Guard, Akamai, Fastly — по CNAME
+        if [[ "$is_cdn" == "false" ]]; then
+            local cname
+            cname=$(_timeout 2 dig +short "$domain" CNAME 2>/dev/null | head -1)
+            if echo "$cname" | grep -qi "cloudflare\|akamai\|fastly\|cdn\|ddos-guard\|cloudfront\|sucuri\|edgekey\|edgesuite"; then
+                is_cdn=true
+            fi
+        fi
+
+        if [[ "$is_cdn" == "true" ]]; then
             tag="→CDN"
         else
             tag="→EXT"
@@ -775,7 +799,7 @@ dns_check_site() {
         ns=$(_timeout 2 dig +short "$parent" NS 2>/dev/null | head -1)
     fi
 
-    if [[ -n "$ns" ]]; then
+    if [[ -z "$ns_provider" && -n "$ns" ]]; then
         # Определяем провайдера по NS
         local ns_lower
         ns_lower=$(echo "$ns" | tr '[:upper:]' '[:lower:]')
@@ -875,20 +899,15 @@ collect_data() {
         uri = req_parts[2]
         if (uri == "") uri = "-"
 
-        # Статус и байты: находим после закрывающих кавычек request
-        # Ищем "STATUS BYTES" после request
+        # Статус и байты из parts[3]: " STATUS BYTES " (между request и referer)
         status = ""; bytes = 0
-        # После parts[2] (request) идёт: " STATUS BYTES "
-        # Проще: пройдёмся по полям
-        found_req_end = 0
-        for (i=1; i<=NF; i++) {
-            if ($i ~ /"$/ && found_req_end == 0) {
-                found_req_end = 1
-                status = $(i+1)
-                bytes = $(i+2)
-                if (bytes !~ /^[0-9]+$/) bytes = 0
-                break
-            }
+        if (n >= 3) {
+            # parts[3] = " 200 1234 " — trim и split
+            gsub(/^ +| +$/, "", parts[3])
+            split(parts[3], sb, " ")
+            status = sb[1]
+            bytes = sb[2]
+            if (bytes !~ /^[0-9]+$/) bytes = 0
         }
 
         # Пропуск мусорных кодов
@@ -1193,8 +1212,8 @@ render_summary() {
 
     echo "  Период (сервер):     ${period_start} — ${period_end} (${SERVER_TZ}, ${PERIOD_LABEL})"
     echo "  Всего запросов:      $(fmt_num "${SUMMARY[total_requests]:-0}")"
-    echo "  Трафик:              ${SUMMARY[traffic_bot]:-0} bot  /  ${SUMMARY[traffic_desktop]:-0} desktop  /  ${SUMMARY[traffic_mobile]:-0} mobile"
-    echo "  Статус-коды:         ${G}${SUMMARY[s2xx]:-0} 2xx${NC}  /  ${C}${SUMMARY[s3xx]:-0} 3xx${NC}  /  ${Y}${SUMMARY[s4xx]:-0} 4xx${NC}  /  ${R}${SUMMARY[s5xx]:-0} 5xx${NC}"
+    echo "  Трафик:              $(fmt_num "${SUMMARY[traffic_bot]:-0}") bot  /  $(fmt_num "${SUMMARY[traffic_desktop]:-0}") desktop  /  $(fmt_num "${SUMMARY[traffic_mobile]:-0}") mobile"
+    echo "  Статус-коды:         ${G}$(fmt_num "${SUMMARY[s2xx]:-0}") 2xx${NC}  /  ${C}$(fmt_num "${SUMMARY[s3xx]:-0}") 3xx${NC}  /  ${Y}$(fmt_num "${SUMMARY[s4xx]:-0}") 4xx${NC}  /  ${R}$(fmt_num "${SUMMARY[s5xx]:-0}") 5xx${NC}"
     echo "  Объём:               $(fmt_bytes "${SUMMARY[total_bytes]:-0}")"
     echo "  Уникальных IP:       $(fmt_num "${SUMMARY[unique_ips]:-0}")"
     echo "  Уникальных ботов:    ${SUMMARY[unique_bots]:-0}"
@@ -1418,7 +1437,7 @@ render_site_uris() {
 
         # URIs для этого сайта
         if [[ -f "${TMPDIR_WORK}/site_uris.tsv" ]]; then
-            grep -P "^${site_name}\t" "${TMPDIR_WORK}/site_uris.tsv" 2>/dev/null | \
+            awk -F'\t' -v site="$site_name" '$1 == site' "${TMPDIR_WORK}/site_uris.tsv" 2>/dev/null | \
                 sort -t$'\t' -k3 -nr | head -n "$OPT_URI_N" | \
                 while IFS=$'\t' read -r _s uri uri_hits; do
                     printf "  %-9s%s\n" "$uri_hits" "$uri"

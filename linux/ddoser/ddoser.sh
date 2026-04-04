@@ -6,7 +6,7 @@
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 set -o pipefail
 
-readonly VERSION="2.0.1"
+readonly VERSION="2.0.2"
 readonly SCRIPT_NAME="DDoSer"
 
 # Подавление ошибок — скрипт должен работать даже при отсутствии утилит
@@ -283,6 +283,8 @@ collect_system_info() {
     OS_VERSION=$(grep -E "^VERSION_ID=" /etc/*release* 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d '"')
     [[ -z "$OS_NAME" ]] && OS_NAME="Unknown"
     [[ -z "$OS_VERSION" ]] && OS_VERSION=""
+    # Сокращаем: "Debian GNU/Linux" → "Debian", "CentOS Linux" → "CentOS"
+    OS_NAME=$(echo "$OS_NAME" | sed 's/ GNU\/Linux//; s/ Linux//')
 
     PHP_VERSION=$(php -v 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1,2)
     [[ -z "$PHP_VERSION" ]] && PHP_VERSION="-"
@@ -291,8 +293,22 @@ collect_system_info() {
     [[ -z "$LOAD_AVG" ]] && LOAD_AVG="-"
     RAM_USED=$(free -m 2>/dev/null | awk '/Mem:/{printf "%.1f/%.1fG", $3/1024, $2/1024}')
     [[ -z "$RAM_USED" ]] && RAM_USED="-"
+
+    # Uptime: сокращаем до "12w 6d 12h"
     UPTIME_STR=$(uptime -p 2>/dev/null | sed 's/up //')
-    [[ -z "$UPTIME_STR" ]] && UPTIME_STR=$(uptime 2>/dev/null | sed 's/.*up //' | sed 's/,.*//')
+    if [[ -n "$UPTIME_STR" ]]; then
+        UPTIME_STR=$(echo "$UPTIME_STR" | sed \
+            -e 's/ years\?/y/g' \
+            -e 's/ months\?/mo/g' \
+            -e 's/ weeks\?/w/g' \
+            -e 's/ days\?/d/g' \
+            -e 's/ hours\?/h/g' \
+            -e 's/ minutes\?/m/g' \
+            -e 's/,//g' \
+            -e 's/  */ /g')
+    else
+        UPTIME_STR=$(uptime 2>/dev/null | sed 's/.*up //' | sed 's/,.*//')
+    fi
     [[ -z "$UPTIME_STR" ]] && UPTIME_STR="-"
 
     SERVER_TZ=$(date +%Z)

@@ -1,742 +1,1681 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  DDoSer 2.0 — Анализатор access-логов для защиты от DDoS               ║
+# ║  Панели: ISPManager · FastPanel · Hestia                                ║
+# ║  Автор: Vladislav Pavlovich · TG @sysadminctl                          ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+set -o pipefail
 
-# Цвета
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BLUE="\033[34m"
-MAGENTA="\033[35m"
-WHITE="\033[97m"
-NC="\033[0m"
-BOLD="\033[1m"
+readonly VERSION="2.0.0"
+readonly SCRIPT_NAME="DDoSer"
 
-# Лог-файл
-LOG_FILE="/var/log/ddoser_script.log"
-log_action() {
-    echo "$(date '+%F %T') $1" >> "$LOG_FILE"
+# Подавление ошибок — скрипт должен работать даже при отсутствии утилит
+_timeout() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$@"
+    else
+        # Без timeout — запускаем напрямую (может зависнуть, но не упадёт)
+        shift  # убираем аргумент секунд
+        "$@"
+    fi
 }
 
-# Определение ОС
-os_name=$(grep -E "^NAME=" /etc/*release* 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d '"')
-os_version=$(grep -E "^VERSION_ID=" /etc/*release* 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d '"')
-if [[ -z "$os_version" ]]; then os_version=0; fi
+# Безопасная арифметика (пустая строка → 0)
+_num() { echo "${1:-0}"; }
 
-# Цвет ОС
-if [[ "$os_name" == *"Debian"* ]]; then
-    if echo "$os_version <= 9" | bc -l | grep -q 1; then os_color="$WHITE";
-    elif echo "$os_version == 10" | bc -l | grep -q 1; then os_color="$BLUE";
-    else os_color="$GREEN"; fi
-elif [[ "$os_name" == *"Ubuntu"* ]]; then
-    if echo "$os_version <= 18" | bc -l | grep -q 1; then os_color="$WHITE";
-    elif echo "$os_version == 20" | bc -l | grep -q 1; then os_color="$BLUE";
-    else os_color="$GREEN"; fi
-elif [[ "$os_name" == *"CentOS"* ]]; then
-    if echo "$os_version <= 7" | bc -l | grep -q 1; then os_color="$MAGENTA";
-    elif echo "$os_version == 8" | bc -l | grep -q 1; then os_color="$CYAN";
-    else os_color="$WHITE"; fi
-else
-    os_color="$CYAN";
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+readonly REPORT_WIDTH=118
+readonly CHART_WIDTH=72
+readonly SITE_LINE_W=116
+
+readonly DEFAULT_TOP_N=50
+readonly DEFAULT_URI_N=10
+readonly DEFAULT_PERIOD="24h"
+
+readonly GEOIP_DIR="/usr/share/GeoIP"
+readonly GEOIP_URL_V4="https://mailfud.org/geoip-legacy/GeoIP.dat.gz"
+readonly GEOIP_URL_V6="https://mailfud.org/geoip-legacy/GeoIPv6.dat.gz"
+readonly GEOIP_MAX_AGE=604800   # 7 дней
+
+# Классификация ботов
+readonly BOTS_GREEN="googlebot|google-inspectiontool|yandexbot|yandexaccessibilitybot|yandexmobilebot"
+readonly BOTS_YELLOW="bingbot|msnbot|semrushbot|ahrefsbot|applebot|meta-externalagent|serpstatbot|duckduckbot"
+# Всё остальное — красные (нежелательные)
+
+# Безопасные страны (не подсвечиваются красным)
+readonly SAFE_COUNTRIES="RU|DE|FR|GB|NL|US|CA|UA|BY|KZ|PL|CZ|FI|SE|NO|DK|AT|CH|IT|ES|PT|IE|BE|LT|LV|EE|BG|RO|HU|SK|SI|HR|JP|KR|AU|NZ|SG|IL"
+
+# Фильтрация мусорных HTTP-кодов
+readonly SKIP_CODES="444|400|403|408|429|499"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  COLORS & FORMATTING
+# ═══════════════════════════════════════════════════════════════════════════
+setup_colors() {
+    if [[ "$SCRIPT_MODE" == "true" ]] || [[ ! -t 1 ]]; then
+        R="" G="" Y="" C="" B="" M="" W="" NC="" BOLD="" DIM=""
+    else
+        R=$'\033[31m'   G=$'\033[32m'   Y=$'\033[33m'
+        C=$'\033[36m'   B=$'\033[34m'   M=$'\033[35m'
+        W=$'\033[97m'   NC=$'\033[0m'   BOLD=$'\033[1m'
+        DIM=$'\033[2m'
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+die()  { echo "${R}Ошибка: $1${NC}" >&2; exit 1; }
+info() { echo "${C}$1${NC}" >&2; }
+warn() { echo "${Y}$1${NC}" >&2; }
+
+fmt_num() {
+    # Portable thousand separator using awk
+    echo "$1" | awk '{
+        s = sprintf("%d", $1)
+        out = ""
+        n = length(s)
+        for (i=1; i<=n; i++) {
+            if (i > 1 && (n-i+1) % 3 == 0) out = out " "
+            out = out substr(s,i,1)
+        }
+        print out
+    }'
+}
+
+fmt_bytes() {
+    local bytes="${1:-0}"
+    if   (( bytes >= 1073741824 )); then awk "BEGIN{printf \"%.1fG\", $bytes/1073741824}"
+    elif (( bytes >= 1048576 ));    then awk "BEGIN{printf \"%.1fM\", $bytes/1048576}"
+    elif (( bytes >= 1024 ));       then awk "BEGIN{printf \"%.1fK\", $bytes/1024}"
+    else echo "${bytes}B"
+    fi
+}
+
+print_header() {
+    local text="$1"
+    local line
+    line=$(printf '═%.0s' $(seq 1 $REPORT_WIDTH))
+    echo ""
+    echo "  ${BOLD}${W}${line}${NC}"
+    echo "  ${BOLD}${W}  ${text}${NC}"
+    echo "  ${BOLD}${W}${line}${NC}"
+}
+
+print_separator() {
+    printf '  '
+    printf '─%.0s' $(seq 1 $SITE_LINE_W)
+    echo ""
+}
+
+# Спиннер
+_spin_pid=0
+spin_start() {
+    local msg="$1"
+    if [[ "$OPT_YES" == "true" ]] || [[ ! -t 1 ]]; then
+        info "$msg"
+        return
+    fi
+    (
+        local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        local i=0
+        while true; do
+            printf "\r  ${C}${chars:$i:1} ${msg}${NC}  " >&2
+            i=$(( (i+1) % ${#chars} ))
+            sleep 0.1
+        done
+    ) &
+    _spin_pid=$!
+    disown $_spin_pid 2>/dev/null
+}
+spin_stop() {
+    if [[ $_spin_pid -ne 0 ]]; then
+        kill $_spin_pid 2>/dev/null
+        wait $_spin_pid 2>/dev/null
+        _spin_pid=0
+        printf "\r\033[K" >&2
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HELP & VERSION
+# ═══════════════════════════════════════════════════════════════════════════
+show_help() {
+    cat <<EOF
+${BOLD}${W}DDoSer ${VERSION}${NC} — Анализатор access-логов для защиты от DDoS
+${DIM}Панели: ISPManager · FastPanel · Hestia${NC}
+
+${BOLD}Использование:${NC}
+  bash <(curl -s URL)
+  bash ddoser.sh [опции]
+
+${BOLD}Режимы:${NC}
+  ${Y}(по умолчанию)${NC}  Интерактивный: цвета, system info, промпты
+  ${Y}-s, --script${NC}    Без цветов и промптов (для записи в файл)
+
+${BOLD}Опции:${NC}
+  ${Y}-t, --time P${NC}    Период: 1h, 6h, 24h, 3 (дня)     [по умолчанию: 24h]
+  ${Y}-n, --top N${NC}     Кол-во строк в топе IP/ботов      [по умолчанию: 50]
+  ${Y}-u, --uris N${NC}    Кол-во URI на сайт                 [по умолчанию: 10]
+  ${Y}-f, --fast${NC}      Пропустить per-site URIs, DNS-проверки
+  ${Y}-q, --quiet${NC}     Пропустить рекомендации
+  ${Y}-y, --yes${NC}       Автоматически подтверждать все промпты
+  ${Y}-p, --priority${NC}  Низкий приоритет (nice/ionice)
+  ${Y}-D, --debug${NC}     Включить set -x
+  ${Y}-V, --version${NC}   Версия
+  ${Y}-h, --help${NC}      Справка
+
+${BOLD}Примеры:${NC}
+  bash ddoser.sh                     # Интерактивный запуск
+  bash ddoser.sh -fqy                # Быстрый запуск без промптов
+  bash ddoser.sh -t 1h -n 20        # Последний час, топ-20
+  bash ddoser.sh -s > report.txt     # Сохранить отчёт в файл
+
+${BOLD}Автор:${NC} Vladislav Pavlovich · TG @sysadminctl
+EOF
+    exit 0
+}
+
+show_version() {
+    echo "DDoSer ${VERSION}"
+    exit 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ARGUMENT PARSING
+# ═══════════════════════════════════════════════════════════════════════════
+OPT_PERIOD="24h"
+OPT_TOP_N=$DEFAULT_TOP_N
+OPT_URI_N=$DEFAULT_URI_N
+OPT_FAST=false
+OPT_QUIET=false
+OPT_YES=false
+OPT_PRIORITY=false
+OPT_DEBUG=false
+SCRIPT_MODE=false
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--time)     OPT_PERIOD="$2"; shift 2 ;;
+            -n|--top)      OPT_TOP_N="$2";  shift 2 ;;
+            -u|--uris)     OPT_URI_N="$2";  shift 2 ;;
+            -f|--fast)     OPT_FAST=true;    shift ;;
+            -q|--quiet)    OPT_QUIET=true;   shift ;;
+            -y|--yes)      OPT_YES=true;     shift ;;
+            -p|--priority) OPT_PRIORITY=true; shift ;;
+            -s|--script)   SCRIPT_MODE=true; OPT_YES=true; shift ;;
+            -D|--debug)    OPT_DEBUG=true;   shift ;;
+            -V|--version)  show_version ;;
+            -h|--help)     show_help ;;
+            -*)
+                # Комбо-флаги: -fqy
+                local flags="${1#-}"
+                shift
+                local i
+                for (( i=0; i<${#flags}; i++ )); do
+                    case "${flags:$i:1}" in
+                        f) OPT_FAST=true ;;
+                        q) OPT_QUIET=true ;;
+                        y) OPT_YES=true ;;
+                        p) OPT_PRIORITY=true ;;
+                        s) SCRIPT_MODE=true; OPT_YES=true ;;
+                        D) OPT_DEBUG=true ;;
+                        V) show_version ;;
+                        h) show_help ;;
+                        *) die "Неизвестный флаг: -${flags:$i:1}. Используйте -h для справки." ;;
+                    esac
+                done
+                ;;
+            *)  die "Неизвестный аргумент: $1. Используйте -h для справки." ;;
+        esac
+    done
+}
+
+parse_args "$@"
+[[ "$OPT_DEBUG" == "true" ]] && set -x
+setup_colors
+
+if [[ "$OPT_PRIORITY" == "true" ]]; then
+    renice -n 19 $$ >/dev/null 2>&1
+    ionice -c3 -p $$ >/dev/null 2>&1
 fi
 
-# Определение панели управления
-CONTROL_PANEL="none"
-PANEL_LOG_PATHS=()
-panel_login_url=""
-CPIP=$(hostname -I | awk '{print $1}')
+# Рассчёт cutoff timestamp
+calc_cutoff() {
+    local period="$OPT_PERIOD"
+    local now
+    now=$(date +%s)
+    local seconds=86400  # default 24h
 
-detect_control_panel() {
-    if systemctl is-active --quiet hestia.service 2>/dev/null || systemctl list-units --type=service | grep -q hestia.service; then
-        CONTROL_PANEL="hestia"
-        PANEL_LOG_PATHS=(/var/log/apache2/domains/*.log)
-        return
+    if [[ "$period" =~ ^([0-9]+)h$ ]]; then
+        seconds=$(( ${BASH_REMATCH[1]} * 3600 ))
+    elif [[ "$period" =~ ^([0-9]+)d?$ ]]; then
+        seconds=$(( ${BASH_REMATCH[1]} * 86400 ))
     fi
-    if systemctl is-active --quiet ihttpd.service 2>/dev/null || systemctl list-units --type=service | grep -q ihttpd.service; then
-        CONTROL_PANEL="ispmanager"
-        PANEL_LOG_PATHS=(/var/www/httpd-logs/*access.log)
-        return
-    fi
-    if systemctl is-active --quiet fastpanel2.service 2>/dev/null || systemctl list-units --type=service | grep -q fastpanel2.service; then
-        CONTROL_PANEL="fastpanel"
-        PANEL_LOG_PATHS=(/var/www/*/data/logs/*access.log)
-        return
-    fi
-    if [[ -d "/usr/local/mgr5" ]] || [[ -d "/usr/local/fastpanel" ]]; then
-        CONTROL_PANEL="fastpanel"
-        PANEL_LOG_PATHS=(/var/www/*/data/logs/*access.log)
-        return
-    fi
-    if [[ -d "/usr/local/vesta" ]]; then
-        CONTROL_PANEL="vesta"
-        PANEL_LOG_PATHS=(/var/log/nginx/domains/*.log)
-        return
-    fi
-    if [[ -d "/usr/local/directadmin" ]]; then
-        CONTROL_PANEL="directadmin"
-        PANEL_LOG_PATHS=(/var/log/httpd/domains/*.log)
-        return
-    fi
-    if [[ -d "/usr/local/cpanel" ]]; then
-        CONTROL_PANEL="cpanel"
-        PANEL_LOG_PATHS=(/usr/local/apache/domlogs/*.log)
-        return
-    fi
-    # По умолчанию
-    if [[ -f "/var/log/nginx/access.log" ]]; then
-        PANEL_LOG_PATHS=(/var/log/nginx/access.log)
-    elif [[ -f "/var/log/apache2/access.log" ]]; then
-        PANEL_LOG_PATHS=(/var/log/apache2/access.log)
-    fi
-}
 
-detect_control_panel
+    CUTOFF_TS=$(( now - seconds ))
+    PERIOD_HOURS=$(( seconds / 3600 ))
+    PERIOD_LABEL="${PERIOD_HOURS}ч"
+    [[ $PERIOD_HOURS -ge 24 ]] && PERIOD_LABEL="$(( PERIOD_HOURS / 24 ))д"
+}
+calc_cutoff
 
-# Генерация ссылки на панель (пример для ISPmanager/FastPanel)
-isplogin() {
-    local CPIP="$1"
-    FVK=$(date | md5sum | head -c16)
-    if [ -f "/usr/local/mgr5/sbin/mgrctl" ]; then
-        /usr/local/mgr5/sbin/mgrctl -m ispmgr session.newkey username=root key="$FVK" sok=o >/dev/null 2>&1
-        echo "https://${CPIP}:1500/manager/ispmgr?func=auth&username=root&key=${FVK}&checkcookie=no"
-    fi
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════
+TMPDIR_WORK=""
+cleanup() {
+    spin_stop
+    [[ -n "$TMPDIR_WORK" ]] && rm -rf "$TMPDIR_WORK"
 }
-fp2login() {
-    local CPIP="$1"
-    echo "https://${CPIP}:8888/"
-}
-vestalogin() {
-    local CPIP="$1"
-    echo "https://${CPIP}:8083/"
-}
-dalogin() {
-    local CPIP="$1"
-    echo "https://${CPIP}:2222/"
-}
-whmlogin() {
-    local CPIP="$1"
-    echo "https://${CPIP}:2087/"
-}
+trap cleanup EXIT INT TERM
 
-case "$CONTROL_PANEL" in
-    ispmanager) panel_login_url=$(isplogin "$CPIP");;
-    fastpanel) panel_login_url=$(fp2login "$CPIP");;
-    vesta) panel_login_url=$(vestalogin "$CPIP");;
-    directadmin) panel_login_url=$(dalogin "$CPIP");;
-    cpanel) panel_login_url=$(whmlogin "$CPIP");;
-    hestia) panel_login_url="(ручной вход, порт 8083)";;
-    *) panel_login_url="(не определено)";;
-esac
+TMPDIR_WORK=$(mktemp -d /tmp/ddoser.XXXXXX)
 
-# Определение сегодняшней даты для логов
-TODAY=$(date '+%d/%b/%Y')
-HOUR=$(date '+%H')
+# ═══════════════════════════════════════════════════════════════════════════
+#  SYSTEM INFO
+# ═══════════════════════════════════════════════════════════════════════════
+collect_system_info() {
+    OS_NAME=$(grep -E "^NAME=" /etc/*release* 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d '"')
+    OS_VERSION=$(grep -E "^VERSION_ID=" /etc/*release* 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d '"')
+    [[ -z "$OS_NAME" ]] && OS_NAME="Unknown"
+    [[ -z "$OS_VERSION" ]] && OS_VERSION=""
 
-# Анализ логов: топ IP, топ URI, топ User-Agent с геолокацией
-analyze_logs() {
-    local log_paths=("${PANEL_LOG_PATHS[@]}")
-    echo -e "${YELLOW}${BOLD}Анализирую логи за сегодня...${NC}"
-    
-    # Показываем прогресс
-    show_progress 1 4 "Подготовка данных"
-    sleep 0.5
-    
-    show_progress 2 4 "Обработка логов"
-    sleep 0.3
-    
-    show_progress 3 4 "Анализ результатов"
-    sleep 0.3
-    
-    show_progress 4 4 "Формирование отчёта"
-    sleep 0.2
-    echo # Новая строка после прогресс-бара
-    
-    # Топ IP с геолокацией
-    echo -e "\n${YELLOW}${BOLD}Топ IP по логам за сегодня:${NC}"
-    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -20 | while read count ip; do
-        if [[ -n "$ip" ]]; then
-            local ip_info=$(get_ip_info "$ip")
-            printf "%8s %-15s %s\n" "$count" "$ip" "$ip_info"
-        fi
-    done | tee /tmp/ddoser_top_ip.log
-    
-    # Топ URI
-    echo -e "\n${CYAN}${BOLD}Топ URI за сегодня:${NC}"
-    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk '{print $7}' | sort | uniq -c | sort -nr | head -20 | tee /tmp/ddoser_top_uri.log
-    
-    # Топ User-Agent
-    echo -e "\n${MAGENTA}${BOLD}Топ User-Agent за сегодня:${NC}"
-    grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk -F'"' '{print $6}' | sort | uniq -c | sort -nr | head -15 | tee /tmp/ddoser_top_ua.log
-    
-    # Простой анализ SQL injection в URI
-    local sql_attacks=$(grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | grep -i "union\|select\|insert\|delete\|update" | awk '{print $1}' | sort | uniq -c | sort -nr)
-    if [[ -n "$sql_attacks" ]]; then
-        echo -e "\n${RED}${BOLD}🔴 Обнаружены потенциальные SQL injection атаки (топ-10):${NC}"
-        echo "$sql_attacks" | head -10 | while read count ip; do
-            if [[ -n "$ip" ]]; then
-                local ip_info=$(get_ip_info "$ip")
-                printf "%8s %-15s %s\n" "$count" "$ip" "$ip_info"
-            fi
-        done
-    fi
-    
-    # Простой анализ XSS в URI
-    local xss_attacks=$(grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | grep -i "script\|alert\|onerror\|onload\|javascript" | awk '{print $1}' | sort | uniq -c | sort -nr)
-    if [[ -n "$xss_attacks" ]]; then
-        echo -e "\n${RED}${BOLD}🔴 Обнаружены потенциальные XSS атаки (топ-10):${NC}"
-        echo "$xss_attacks" | head -10 | while read count ip; do
-            if [[ -n "$ip" ]]; then
-                local ip_info=$(get_ip_info "$ip")
-                printf "%8s %-15s %s\n" "$count" "$ip" "$ip_info"
-            fi
-        done
-    fi
-    
-    # Простой анализ ботов в User-Agent
-    local bot_agents=$(grep -h "$TODAY" ${log_paths[@]} 2>/dev/null | awk -F'"' '{print $6}' | grep -i "bot\|crawler\|spider\|scraper\|scanner" | sort | uniq -c | sort -nr)
-    if [[ -n "$bot_agents" ]]; then
-        echo -e "\n${BLUE}${BOLD}🤖 Обнаружены боты (топ-10):${NC}"
-        echo "$bot_agents" | head -10
-    fi
-}
+    PHP_VERSION=$(php -v 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1,2)
+    [[ -z "$PHP_VERSION" ]] && PHP_VERSION="-"
 
-# Анализ сетевых соединений
-analyze_connections() {
-    echo -e "\n${GREEN}${BOLD}Топ IP по активным соединениям (netstat):${NC}"
-    netstat -ntu 2>/dev/null | awk 'NR>2{print $5}' | cut -d: -f1 | grep -v '^$' | sort | uniq -c | sort -nr | head -20 | tee /tmp/ddoser_top_conn.log
-    echo -e "\n${BLUE}${BOLD}Топ IP по активным соединениям (ss):${NC}"
-    ss -ntu 2>/dev/null | awk 'NR>1{print $5}' | cut -d: -f1 | grep -v '^$' | sort | uniq -c | sort -nr | head -20
-}
+    LOAD_AVG=$(cat /proc/loadavg 2>/dev/null | awk '{print $1}')
+    [[ -z "$LOAD_AVG" ]] && LOAD_AVG="-"
+    RAM_USED=$(free -m 2>/dev/null | awk '/Mem:/{printf "%.1f/%.1fG", $3/1024, $2/1024}')
+    [[ -z "$RAM_USED" ]] && RAM_USED="-"
+    UPTIME_STR=$(uptime -p 2>/dev/null | sed 's/up //')
+    [[ -z "$UPTIME_STR" ]] && UPTIME_STR=$(uptime 2>/dev/null | sed 's/.*up //' | sed 's/,.*//')
+    [[ -z "$UPTIME_STR" ]] && UPTIME_STR="-"
 
-# Показать нагрузку
-show_load() {
-    echo -e "\n${YELLOW}${BOLD}Нагрузка на сервер:${NC}"
-    uptime
-    echo -e "${CYAN}Топ процессов по CPU:${NC}"
-    ps aux --sort=-%cpu | head -10
-    echo -e "${CYAN}Топ процессов по памяти:${NC}"
-    ps aux --sort=-%mem | head -10
-}
+    SERVER_TZ=$(date +%Z)
+    SERVER_TIME=$(date '+%H:%M %Z')
 
-# Блокировка IP (генерация команд)
-block_ip() {
-    local ip="$1"
-    local ip_info=$(get_ip_info "$ip")
-    echo -e "${RED}${BOLD}Команды для блокировки IP $ip $ip_info:${NC}"
-    echo -e "${YELLOW}iptables:${NC} iptables -I INPUT -s $ip -j DROP"
-    echo -e "${YELLOW}ipset:${NC} ipset add blacklist $ip"
-    echo -e "${YELLOW}ufw:${NC} ufw deny from $ip"
-    echo -e "${YELLOW}Чтобы выполнить:${NC}"
-    echo -e "${CYAN}iptables -I INPUT -s $ip -j DROP && echo 'IP $ip заблокирован'${NC}"
-    log_action "Сгенерирована команда блокировки для $ip $ip_info"
-}
+    # Диски
+    DISK_INFO=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
+    [[ -z "$DISK_INFO" ]] && DISK_INFO="-"
+    INODE_INFO=$(df -i / 2>/dev/null | awk 'NR==2{print $5}')
+    [[ -z "$INODE_INFO" ]] && INODE_INFO="-"
 
-# Блокировка IP (автоматическая)
-block_ip_auto() {
-    echo -e "\n${YELLOW}${BOLD}Топ IP по логам за сегодня:${NC}"
-    local ip_list=()
-    local counter=1
-    
-    # Читаем топ IP из временного файла
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            # Извлекаем IP из строки (формат: количество IP информация)
-            local ip=$(echo "$line" | awk '{print $2}')
-            if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                ip_list+=("$ip")
-                echo -e "${counter}. $line"
-                counter=$((counter + 1))
-            fi
-        fi
-    done < /tmp/ddoser_top_ip.log
-    
-    if [[ ${#ip_list[@]} -eq 0 ]]; then
-        echo -e "${RED}Не найдено IP для блокировки${NC}"
-        return
-    fi
-    
-    echo -ne "\n${YELLOW}Введите номера IP для блокировки (например: 1, 3, 5 или 1-3): ${NC}"
-    read ip_choices
-    
-    if [[ -z "$ip_choices" ]]; then
-        echo -e "${RED}Ошибка: Не выбраны IP для блокировки!${NC}"
-        return
-    fi
-    
-    # Парсим выбор пользователя
-    local selected_ips=()
-    IFS=','',' read -ra choices <<< "$ip_choices"
-    for choice in "${choices[@]}"; do
-        choice=$(echo "$choice" | tr -d ' ')
-        if [[ "$choice" =~ ^[0-9]+-[0-9]+$ ]]; then
-            # Диапазон
-            local start=$(echo "$choice" | cut -d'-' -f1)
-            local end=$(echo "$choice" | cut -d'-' -f2)
-            for ((i=start; i<=end; i++)); do
-                if [[ $i -ge 1 && $i -le ${#ip_list[@]} ]]; then
-                    selected_ips+=("${ip_list[$((i-1))]}")
-                fi
-            done
-        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
-            # Одиночный выбор
-            if [[ $choice -ge 1 && $choice -le ${#ip_list[@]} ]]; then
-                selected_ips+=("${ip_list[$((choice-1))]}")
-            fi
-        fi
+    # Сервисы
+    SVC_NGINX="—"; SVC_APACHE="—"; SVC_MYSQL="—"
+    systemctl is-active --quiet nginx 2>/dev/null   && SVC_NGINX="${G}✓${NC}" || SVC_NGINX="${R}✗${NC}"
+    systemctl is-active --quiet apache2 2>/dev/null  && SVC_APACHE="${G}✓${NC}" || {
+        systemctl is-active --quiet httpd 2>/dev/null && SVC_APACHE="${G}✓${NC}" || SVC_APACHE="${DIM}—${NC}"
+    }
+    for svc in mysql mariadb mysqld; do
+        systemctl is-active --quiet "$svc" 2>/dev/null && { SVC_MYSQL="${G}✓${NC}"; break; }
     done
-    
-    # Блокируем выбранные IP
-    for ip in "${selected_ips[@]}"; do
-        echo -e "${CYAN}Блокирую IP: $ip${NC}"
-        iptables -I INPUT -s "$ip" -j DROP 2>/dev/null
-        if [[ $? -eq 0 ]]; then
-            echo -e "${GREEN}✓ IP $ip успешно заблокирован${NC}"
-            log_action "Заблокирован IP $ip"
-        else
-            echo -e "${RED}✗ Ошибка блокировки IP $ip${NC}"
-        fi
-    done
-}
 
-# Блокировка User-Agent
-block_user_agent() {
-    echo -e "\n${MAGENTA}${BOLD}Топ User-Agent за сегодня:${NC}"
-    local ua_list=()
-    local counter=1
-    
-    # Читаем топ User-Agent из временного файла и показываем в оригинальном формате
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            # Сохраняем всю строку для последующего использования
-            ua_list+=("$line")
-            # Показываем как в оригинале (количество + User-Agent)
-            echo -e "${counter}. $line"
-            counter=$((counter + 1))
-        fi
-    done < /tmp/ddoser_top_ua.log
-    
-    if [[ ${#ua_list[@]} -eq 0 ]]; then
-        echo -e "${RED}Не найдено User-Agent для блокировки${NC}"
-        return
-    fi
-    
-    echo -ne "\n${MAGENTA}Введите номера User-Agent для блокировки (например: 1, 3, 5 или 1-3): ${NC}"
-    read ua_choices
-    
-    if [[ -z "$ua_choices" ]]; then
-        echo -e "${RED}Ошибка: Не выбраны User-Agent для блокировки!${NC}"
-        return
-    fi
-    
-    # Парсим выбор пользователя
-    local selected_uas=()
-    IFS=',' read -ra choices <<< "$ua_choices"
-    for choice in "${choices[@]}"; do
-        choice=$(echo "$choice" | tr -d ' ')
-        if [[ "$choice" =~ ^[0-9]+-[0-9]+$ ]]; then
-            # Диапазон
-            local start=$(echo "$choice" | cut -d'-' -f1)
-            local end=$(echo "$choice" | cut -d'-' -f2)
-            for ((i=start; i<=end; i++)); do
-                if [[ $i -ge 1 && $i -le ${#ua_list[@]} ]]; then
-                    selected_uas+=("${ua_list[$((i-1))]}")
-                fi
-            done
-        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
-            # Одиночный выбор
-            if [[ $choice -ge 1 && $choice -le ${#ua_list[@]} ]]; then
-                selected_uas+=("${ua_list[$((choice-1))]}")
-            fi
-        fi
-    done
-    
-    if [[ ${#selected_uas[@]} -eq 0 ]]; then
-        echo -e "${RED}Ошибка: Не выбраны корректные User-Agent для блокировки!${NC}"
-        return
-    fi
-    
-    # Извлекаем только User-Agent из выбранных строк (убираем количество в начале)
-    local clean_uas=()
-    for ua_line in "${selected_uas[@]}"; do
-        # Извлекаем User-Agent из строки формата: "количество User-Agent"
-        # Удаляем ведущие пробелы и цифры в начале строки
-        local clean_ua=$(echo "$ua_line" | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]*//')
-        clean_uas+=("$clean_ua")
-    done
-    
-    # Определяем путь для конфигурации в зависимости от панели управления
-    local config_path=""
-    local config_file=""
+    # Connections
+    CONN_COUNT=$(ss -ntu 2>/dev/null | tail -n+2 | wc -l)
+
+    # iptables policy
+    IPT_POLICY=$(iptables -L INPUT 2>/dev/null | head -1 | awk '{print $NF}' | tr -d '()')
+    [[ -z "$IPT_POLICY" ]] && IPT_POLICY="N/A"
+
+    # GeoIP дата
+    GEOIP_DATE="-"
+    [[ -f "${GEOIP_DIR}/GeoIP.dat" ]] && GEOIP_DATE=$(date -r "${GEOIP_DIR}/GeoIP.dat" '+%Y-%m-%d' 2>/dev/null)
+
+    # Панель: дата обновления
+    PANEL_UPDATED=""
     case "$CONTROL_PANEL" in
-        fastpanel)
-            config_path="/etc/nginx/fastpanel2-includes"
-            config_file="blockua.conf"
-            ;;
         ispmanager)
-            config_path="/etc/nginx/vhosts-includes"
-            config_file="blockua.conf"
+            local bin="/usr/local/mgr5/sbin/ihttpd"
+            if [[ -f "$bin" ]]; then
+                local age=$(( ($(date +%s) - $(stat -c %Y "$bin" 2>/dev/null || echo 0)) / 86400 ))
+                PANEL_UPDATED="${age}д назад"
+                (( age > 90 )) && PANEL_UPDATED="${R}${age}д назад${NC}"
+            fi
+            # Версия
+            local isp_ver=""
+            if [[ -f "/usr/local/mgr5/sbin/licctl" ]]; then
+                isp_ver=$(/usr/local/mgr5/sbin/licctl info ispmgr 2>/dev/null | grep -i "version" | head -1 | awk '{print $NF}' | cut -d. -f1)
+            fi
+            [[ -n "$isp_ver" ]] && PANEL_DISPLAY="ISPManager $isp_ver" || PANEL_DISPLAY="ISPManager"
+            ;;
+        fastpanel)
+            local bin="/opt/fastpanel2/bin/fastpanel2"
+            [[ ! -f "$bin" ]] && bin=$(find /opt/fastpanel* -name "fastpanel*" -type f 2>/dev/null | head -1)
+            if [[ -n "$bin" ]] && [[ -f "$bin" ]]; then
+                local age=$(( ($(date +%s) - $(stat -c %Y "$bin" 2>/dev/null || echo 0)) / 86400 ))
+                PANEL_UPDATED="${age}д назад"
+                (( age > 90 )) && PANEL_UPDATED="${R}${age}д назад${NC}"
+            fi
+            PANEL_DISPLAY="FastPanel"
             ;;
         hestia)
-            # Для Hestia создаем файлы в домашних директориях пользователей
-            echo -e "${CYAN}Создаю конфигурационные файлы для Hestia...${NC}"
-            local hestia_count=0
-            
-            # Находим все файлы nginx.ssl.conf
-            while IFS= read -r -d '' file; do
-                if [[ -f "$file" ]]; then
-                    local badbot_file="${file}_badbot"
-                    
-                    # Создаем или обновляем файл _badbot
-                    if [[ -f "$badbot_file" ]]; then
-                        echo -e "${YELLOW}Файл $badbot_file уже существует. Добавляю новые правила.${NC}"
-                        # Добавляем маркер начала новых правил
-                        echo "" >> "$badbot_file"
-                        echo "# Добавлены правила $(date)" >> "$badbot_file"
-                    else
-                        echo -e "${CYAN}Создаю новый файл: $badbot_file${NC}"
-                        # Создаем новый файл с заголовком
-                        {
-                            echo "# Блокировка User-Agent (сгенерировано DDoSer)"
-                            echo "# Дата: $(date)"
-                        } > "$badbot_file"
-                    fi
-                    
-                    # Добавляем правила блокировки
-                    for ua in "${clean_uas[@]}"; do
-                        # Экранируем специальные символы в User-Agent
-                        local escaped_ua=$(echo "$ua" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                        echo "if (\$http_user_agent ~ \"^${escaped_ua}$\") { return 444; }" >> "$badbot_file"
+            local bin="/usr/local/hestia/bin/v-list-sys-info"
+            if [[ -f "$bin" ]]; then
+                local age=$(( ($(date +%s) - $(stat -c %Y "$bin" 2>/dev/null || echo 0)) / 86400 ))
+                PANEL_UPDATED="${age}д назад"
+                (( age > 90 )) && PANEL_UPDATED="${R}${age}д назад${NC}"
+            fi
+            PANEL_DISPLAY="Hestia"
+            local hestia_ver=$(/usr/local/hestia/bin/v-list-sys-info 2>/dev/null | awk 'NR==3{print $1}')
+            [[ -n "$hestia_ver" ]] && PANEL_DISPLAY="Hestia ${hestia_ver}"
+            ;;
+        *)
+            PANEL_DISPLAY="не определена"
+            ;;
+    esac
+    [[ -n "$PANEL_UPDATED" ]] && PANEL_DISPLAY="${PANEL_DISPLAY} · обновлена ${PANEL_UPDATED}"
+}
+
+render_system_info() {
+    local w=$(( REPORT_WIDTH - 4 ))
+    local line
+    line=$(printf '─%.0s' $(seq 1 $w))
+    echo ""
+    echo "  ${BOLD}${W}┌─${line}─┐${NC}"
+    echo "  ${BOLD}${W}│${NC} Система:  ${OS_NAME} ${OS_VERSION} · PHP ${PHP_VERSION} · LA ${LOAD_AVG} · RAM ${RAM_USED} · Up ${UPTIME_STR} · ${SERVER_TIME}"
+    echo "  ${BOLD}${W}│${NC}"
+    echo "  ${BOLD}${W}│${NC} Панель:   ${PANEL_DISPLAY}"
+    echo "  ${BOLD}${W}│${NC}"
+    echo "  ${BOLD}${W}│${NC} Диски:    ${DISK_INFO} · Inodes ${INODE_INFO}"
+    echo "  ${BOLD}${W}│${NC}"
+    echo "  ${BOLD}${W}│${NC} Сервисы:  nginx ${SVC_NGINX} · apache ${SVC_APACHE} · mysql ${SVC_MYSQL}"
+    echo "  ${BOLD}${W}│${NC}"
+    echo "  ${BOLD}${W}│${NC} Сеть:     INPUT ${IPT_POLICY} · Соединений: ${CONN_COUNT} · GeoIP ${GEOIP_DATE}"
+    echo "  ${BOLD}${W}└─${line}─┘${NC}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PANEL DETECTION & LOG PATHS
+# ═══════════════════════════════════════════════════════════════════════════
+CONTROL_PANEL="none"
+LOG_FILES=()
+SITE_COUNT=0
+SERVER_IP=""
+
+detect_panel() {
+    SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+    # ISPManager
+    if [[ -d "/usr/local/mgr5" ]] || systemctl is-active --quiet ihttpd.service 2>/dev/null; then
+        CONTROL_PANEL="ispmanager"
+        return
+    fi
+
+    # FastPanel
+    if systemctl is-active --quiet fastpanel2.service 2>/dev/null || [[ -d "/usr/local/fastpanel" ]]; then
+        CONTROL_PANEL="fastpanel"
+        return
+    fi
+
+    # Hestia
+    if [[ -d "/usr/local/hestia" ]] || systemctl is-active --quiet hestia.service 2>/dev/null; then
+        CONTROL_PANEL="hestia"
+        return
+    fi
+
+    CONTROL_PANEL="none"
+}
+
+collect_log_files() {
+    local -a patterns=()
+
+    case "$CONTROL_PANEL" in
+        ispmanager)
+            patterns=( /var/www/httpd-logs/*.access.log )
+            ;;
+        fastpanel)
+            # Предпочитаем backend-логи
+            local -a backend=( /var/www/*/data/logs/*-backend.access.log )
+            if [[ -e "${backend[0]}" ]]; then
+                patterns=( "${backend[@]}" )
+                # Добавляем frontend для сайтов без backend
+                for dir in /var/www/*/data/logs/; do
+                    [[ -d "$dir" ]] || continue
+                    local site_name=$(basename "$(dirname "$(dirname "$dir")")")
+                    local has_backend=false
+                    for f in "${backend[@]}"; do
+                        [[ "$f" == *"$site_name"* ]] && { has_backend=true; break; }
                     done
-                    
-                    hestia_count=$((hestia_count + 1))
-                fi
-            done < <(find /home -type f -name "nginx.ssl.conf" -print0 2>/dev/null)
-            
-            if [[ $hestia_count -eq 0 ]]; then
-                echo -e "${RED}Не найдено файлов nginx.ssl.conf для Hestia${NC}"
-                return
+                    if [[ "$has_backend" == "false" ]]; then
+                        for f in "$dir"*-frontend.access.log; do
+                            [[ -f "$f" ]] && patterns+=( "$f" )
+                        done
+                    fi
+                done
             else
-                echo -e "${GREEN}✓ Обработано доменов Hestia: $hestia_count${NC}"
-                
-                # Перезагружаем nginx
-                echo -e "${CYAN}Перезагружаю nginx...${NC}"
-                if systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null; then
-                    echo -e "${GREEN}✓ Nginx успешно перезагружен${NC}"
-                    echo -e "${GREEN}✓ Добавлены User-Agent: ${#clean_uas[@]} шт. для $hestia_count доменов${NC}"
-                    log_action "Добавлены User-Agent: ${#clean_uas[@]} шт. для $hestia_count доменов (Hestia)"
-                else
-                    echo -e "${RED}✗ Ошибка перезагрузки nginx${NC}"
-                fi
+                patterns=( /var/www/*/data/logs/*access.log )
             fi
-            return
             ;;
-        *)
-            echo -e "${RED}Блокировка User-Agent поддерживается только для FastPanel, ISPmanager и Hestia${NC}"
-            return
+        hestia)
+            patterns=( /var/log/apache2/domains/*.log )
+            # Если нет apache-логов, используем nginx
+            if ! ls ${patterns[0]} >/dev/null 2>&1; then
+                patterns=( /var/log/nginx/domains/*.log )
+            fi
+            ;;
+        none)
+            if [[ -f "/var/log/nginx/access.log" ]]; then
+                patterns=( /var/log/nginx/access.log )
+            elif [[ -f "/var/log/apache2/access.log" ]]; then
+                patterns=( /var/log/apache2/access.log )
+            fi
             ;;
     esac
-    
-    # Создаем конфигурационный файл для FastPanel и ISPmanager
-    local full_path="$config_path/$config_file"
-    echo -e "${CYAN}Работаю с конфигурационным файлом: $full_path${NC}"
-    
-    # Создаем директорию если она не существует
-    mkdir -p "$config_path" 2>/dev/null
-    
-    # Проверяем, существует ли файл
-    if [[ -f "$full_path" ]]; then
-        echo -e "${YELLOW}Файл уже существует. Добавляю новые правила в конец файла.${NC}"
-        # Создаем временный файл с новыми правилами
-        local tmp_file="/tmp/blockua_new.rules"
-        {
-            echo ""
-            echo "# Добавлены правила $(date)"
-            echo ""
-            
-            # Добавляем новые правила
-            for ua in "${clean_uas[@]}"; do
-                # Экранируем специальные символы в User-Agent
-                local escaped_ua=$(echo "$ua" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                echo "if (\$http_user_agent ~ \"^${escaped_ua}$\") {"
-                echo "    return 403;"
-                echo "}"
-            done
-        } > "$tmp_file"
-        
-        # Добавляем новые правила в существующий файл
-        cat "$tmp_file" >> "$full_path"
-        rm -f "$tmp_file"
-    else
-        echo -e "${CYAN}Создаю новый конфигурационный файл: $full_path${NC}"
-        # Создаем новый файл с заголовком и правилами
-        {
-            echo "# Блокировка User-Agent (сгенерировано DDoSer)"
-            echo "# Дата: $(date)"
-            echo ""
-            
-            # Добавляем правила
-            for ua in "${clean_uas[@]}"; do
-                # Экранируем специальные символы в User-Agent
-                local escaped_ua=$(echo "$ua" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                echo "if (\$http_user_agent ~ \"^${escaped_ua}$\") {"
-                echo "    return 403;"
-                echo "}"
-            done
-        } > "$full_path"
+
+    # Собираем файлы
+    local f
+    for f in "${patterns[@]}"; do
+        [[ -f "$f" ]] && [[ -s "$f" ]] && LOG_FILES+=( "$f" )
+    done
+
+    # Ротированные логи (.log.1) при периоде >= 24h
+    if [[ $PERIOD_HOURS -ge 24 ]]; then
+        for f in "${patterns[@]}"; do
+            local rotated="${f}.1"
+            [[ -f "$rotated" ]] && [[ -s "$rotated" ]] && LOG_FILES+=( "$rotated" )
+        done
     fi
-    
-    # Проверяем конфигурацию nginx
-    echo -e "${CYAN}Проверяю конфигурацию nginx...${NC}"
-    if nginx -t 2>/dev/null; then
-        echo -e "${GREEN}✓ Конфигурация nginx корректна${NC}"
-        
-        # Перезагружаем nginx
-        echo -e "${CYAN}Перезагружаю nginx...${NC}"
-        if systemctl reload nginx 2>/dev/null || service nginx reload 2>/dev/null; then
-            echo -e "${GREEN}✓ Nginx успешно перезагружен${NC}"
-            echo -e "${GREEN}✓ Добавлены User-Agent: ${#clean_uas[@]} шт.${NC}"
-            log_action "Добавлены User-Agent: ${#clean_uas[@]} шт."
+
+    SITE_COUNT=${#LOG_FILES[@]}
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════════════════
+install_pkg() {
+    local pkg="$1"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y "$pkg" >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg" >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg" >/dev/null 2>&1
+    fi
+}
+
+ensure_dependencies() {
+    # geoiplookup
+    if ! command -v geoiplookup >/dev/null 2>&1; then
+        info "Устанавливаю geoiplookup..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq >/dev/null 2>&1
+            install_pkg "geoip-bin"
         else
-            echo -e "${RED}✗ Ошибка перезагрузки nginx${NC}"
-        fi
-    else
-        echo -e "${RED}✗ Ошибка в конфигурации nginx. Отмена.${NC}"
-        # Показываем содержимое файла для отладки
-        echo -e "${YELLOW}Содержимое конфигурационного файла:${NC}"
-        cat "$full_path"
-        # Если файл новый, удаляем его в случае ошибки
-        if [[ ! -f "$full_path.backup" ]]; then
-            rm -f "$full_path"
+            install_pkg "GeoIP"
         fi
     fi
-}
 
-# Сохранить действия
-save_report() {
-    local now="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo -e "\n==============================" >> "$LOG_FILE"
-    echo -e "DDoSer Report | $now" >> "$LOG_FILE"
-    echo -e "==============================" >> "$LOG_FILE"
-    echo -e "Топ IP по логам за сегодня:" >> "$LOG_FILE"
-    cat /tmp/ddoser_top_ip.log >> "$LOG_FILE"
-    echo -e "\nТоп URI за сегодня:" >> "$LOG_FILE"
-    cat /tmp/ddoser_top_uri.log >> "$LOG_FILE"
-    echo -e "\nТоп User-Agent за сегодня:" >> "$LOG_FILE"
-    cat /tmp/ddoser_top_ua.log >> "$LOG_FILE"
-    echo -e "\nТоп IP по активным соединениям (netstat):" >> "$LOG_FILE"
-    cat /tmp/ddoser_top_conn.log >> "$LOG_FILE"
-    echo -e "\n==============================\n" >> "$LOG_FILE"
-    log_action "Отчёт сохранён"
-}
-
-# Реальный мониторинг (N секунд)
-real_time_monitoring() {
-    local log_paths=("${PANEL_LOG_PATHS[@]}")
-    local tmpfile="/tmp/ddoser_realtime.log"
-    read -p "Введите время мониторинга в секундах (по умолчанию 30): " monitor_time
-    if [[ -z "$monitor_time" ]]; then monitor_time=30; fi
-    echo -e "${YELLOW}${BOLD}В течение $monitor_time секунд буду собирать информацию о текущих соединениях и логах. Пожалуйста, ожидайте...${NC}"
-    rm -f "$tmpfile"
-    (for log in "${log_paths[@]}"; do tail -F "$log" 2>/dev/null; done) | tee "$tmpfile" &
-    TAIL_PID=$!
-    sleep $monitor_time
-    kill $TAIL_PID 2>/dev/null
-    echo -e "\n${CYAN}${BOLD}Анализ за последние $monitor_time секунд:${NC}"
-    if [[ -s "$tmpfile" ]]; then
-        echo -e "${YELLOW}Топ IP:${NC}"
-        awk '{print $1}' "$tmpfile" | sort | uniq -c | sort -nr | head -10
-        echo -e "\n${CYAN}Топ URI:${NC}"
-        awk '{print $7}' "$tmpfile" | sort | uniq -c | sort -nr | head -10
-        echo -e "\n${RED}Подозрительные IP (более 100 запросов):${NC}"
-        awk '{print $1}' "$tmpfile" | sort | uniq -c | awk '$1>100' | sort -nr
-    else
-        echo -e "${RED}Нет новых записей в логах за $monitor_time секунд.${NC}"
+    # whois (fallback)
+    if ! command -v whois >/dev/null 2>&1; then
+        install_pkg "whois" 2>/dev/null
     fi
-    rm -f "$tmpfile"
+
+    # dig (для DNS-проверок)
+    if [[ "$OPT_FAST" != "true" ]] && ! command -v dig >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            install_pkg "dnsutils"
+        else
+            install_pkg "bind-utils"
+        fi
+    fi
+
+    # Обновление GeoIP баз
+    update_geoip
 }
 
-# Прогресс-бар
-show_progress() {
-    local current=$1
-    local total=$2
-    local message=$3
-    local width=50
-    local progress=$((current * width / total))
-    local percentage=$((current * 100 / total))
-    
-    printf "\r${CYAN}$message: [${NC}"
-    for ((i=0; i<progress; i++)); do printf "${GREEN}█${NC}"; done
-    for ((i=progress; i<width; i++)); do printf "░"; done
-    printf "${CYAN}] %d%%${NC}" $percentage
+update_geoip() {
+    local marker="/tmp/.ddoser-geoip-update"
+    # Не обновляем чаще раза в день
+    if [[ -f "$marker" ]]; then
+        local marker_age=$(( $(date +%s) - $(stat -c %Y "$marker" 2>/dev/null || echo 0) ))
+        (( marker_age < 86400 )) && return
+    fi
+
+    local need_update=false
+    if [[ ! -f "${GEOIP_DIR}/GeoIP.dat" ]]; then
+        need_update=true
+    else
+        local file_age=$(( $(date +%s) - $(stat -c %Y "${GEOIP_DIR}/GeoIP.dat" 2>/dev/null || echo 0) ))
+        (( file_age > GEOIP_MAX_AGE )) && need_update=true
+    fi
+
+    if [[ "$need_update" == "true" ]] && command -v curl >/dev/null 2>&1; then
+        spin_start "Обновление GeoIP баз..."
+        mkdir -p "$GEOIP_DIR" 2>/dev/null
+        curl -sL "$GEOIP_URL_V4" 2>/dev/null | gunzip > "${GEOIP_DIR}/GeoIP.dat" 2>/dev/null
+        curl -sL "$GEOIP_URL_V6" 2>/dev/null | gunzip > "${GEOIP_DIR}/GeoIPv6.dat" 2>/dev/null
+        spin_stop
+        # Если скачать не удалось, пробуем apt
+        if [[ ! -s "${GEOIP_DIR}/GeoIP.dat" ]]; then
+            install_pkg "geoip-database" 2>/dev/null
+        fi
+    fi
+    touch "$marker" 2>/dev/null
 }
 
-# Глобальная переменная для отслеживания статуса whois
-WHOIS_STATUS="unknown"
-WHOIS_INSTALL_ATTEMPTED=false
-WHOIS_FAILED_COUNT=0
+# ═══════════════════════════════════════════════════════════════════════════
+#  GeoIP FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+declare -A GEO_CACHE
 
-# Функция для получения информации о IP
-get_ip_info() {
+geo_lookup() {
     local ip="$1"
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # Проверяем наличие whois
-        if ! command -v whois >/dev/null 2>&1; then
-            # Пытаемся установить whois автоматически только один раз
-            if [[ "$WHOIS_INSTALL_ATTEMPTED" == "false" ]]; then
-                WHOIS_INSTALL_ATTEMPTED=true
-                echo -e "${YELLOW}Устанавливаю whois...${NC}" >&2
-                
-                if command -v apt-get >/dev/null 2>&1; then
-                    if apt-get update >/dev/null 2>&1 && apt-get install -y whois >/dev/null 2>&1; then
-                        WHOIS_STATUS="installed"
-                    else
-                        WHOIS_STATUS="install_failed"
-                    fi
-                elif command -v yum >/dev/null 2>&1; then
-                    if yum install -y whois >/dev/null 2>&1; then
-                        WHOIS_STATUS="installed"
-                    else
-                        WHOIS_STATUS="install_failed"
-                    fi
-                elif command -v dnf >/dev/null 2>&1; then
-                    if dnf install -y whois >/dev/null 2>&1; then
-                        WHOIS_STATUS="installed"
-                    else
-                        WHOIS_STATUS="install_failed"
-                    fi
-                else
-                    WHOIS_STATUS="no_package_manager"
-                fi
-            fi
+    [[ -n "${GEO_CACHE[$ip]+x}" ]] && { echo "${GEO_CACHE[$ip]}"; return; }
+
+    local result=""
+    if command -v geoiplookup >/dev/null 2>&1; then
+        if [[ "$ip" == *:* ]]; then
+            result=$(geoiplookup6 "$ip" 2>/dev/null | head -1 | sed 's/.*: //')
         else
-            WHOIS_STATUS="available"
+            result=$(geoiplookup "$ip" 2>/dev/null | head -1 | sed 's/.*: //')
         fi
-        
-        # Пытаемся получить информацию через whois
-        if command -v whois >/dev/null 2>&1 && [[ "$WHOIS_STATUS" != "install_failed" ]]; then
-            local country=$(timeout 5 whois "$ip" 2>/dev/null | grep -i "country:\|Country:" | head -1 | awk '{print $2}' | tr -d '\r')
-            local org=$(timeout 5 whois "$ip" 2>/dev/null | grep -i "org:\|organisation:\|OrgName:" | head -1 | sed 's/^[^:]*://g' | sed 's/^[ \t]*//g' | cut -c1-30 | tr -d '\r')
-            
-            if [[ -n "$country" && -n "$org" ]]; then
-                echo "[$country/$org]"
-                return
-            elif [[ -n "$country" ]]; then
-                echo "[$country]"
-                return
-            elif [[ -n "$org" ]]; then
-                echo "[$org]"
-                return
-            else
-                # whois не вернул данные
-                WHOIS_FAILED_COUNT=$((WHOIS_FAILED_COUNT + 1))
-                echo "[Unknown]"
-                return
-            fi
-        else
-            # whois недоступен
-            echo "[No data]"
+        [[ "$result" == *"not found"* ]] && result=""
+        [[ "$result" == *"IP Address"* ]] && result=""
+    fi
+
+    # whois fallback
+    if [[ -z "$result" ]] && command -v whois >/dev/null 2>&1; then
+        local country
+        country=$(_timeout 3 whois "$ip" 2>/dev/null | grep -i "^country:" | head -1 | awk '{print $2}' | tr -d '\r')
+        [[ -n "$country" ]] && result="${country}, Unknown"
+    fi
+
+    [[ -z "$result" ]] && result="??, Unknown"
+    GEO_CACHE["$ip"]="$result"
+    echo "$result"
+}
+
+geo_batch_resolve() {
+    # Batch-резолв всех IP из файла
+    local ip_file="$1"
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        geo_lookup "$ip" >/dev/null
+    done < "$ip_file"
+}
+
+geo_country_code() {
+    local geo_str="$1"
+    echo "$geo_str" | cut -d',' -f1 | tr -d ' '
+}
+
+geo_country_name() {
+    local geo_str="$1"
+    echo "$geo_str" | cut -d',' -f2- | sed 's/^ //'
+}
+
+is_safe_country() {
+    local code="$1"
+    echo "$code" | grep -qE "^(${SAFE_COUNTRIES})$"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BOT CLASSIFICATION
+# ═══════════════════════════════════════════════════════════════════════════
+bot_class() {
+    local ua_lower
+    ua_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+
+    # Green — поисковики
+    if echo "$ua_lower" | grep -qE "(${BOTS_GREEN})"; then
+        echo "green"
+        return
+    fi
+
+    # Yellow — коммерческие
+    if echo "$ua_lower" | grep -qE "(${BOTS_YELLOW})"; then
+        echo "yellow"
+        return
+    fi
+
+    # Red — нежелательные
+    echo "red"
+}
+
+extract_bot_name() {
+    local ua="$1"
+    local name
+
+    # Стандартные боты: "compatible; BotName/1.0"
+    name=$(echo "$ua" | grep -oP 'compatible;\s*\K[^/;]+' | head -1)
+    [[ -n "$name" ]] && { echo "$name"; return; }
+
+    # Формат "BotName/1.0"
+    name=$(echo "$ua" | grep -oP '\b[A-Z][a-zA-Z]*[Bb]ot\b' | head -1)
+    [[ -n "$name" ]] && { echo "$name"; return; }
+
+    name=$(echo "$ua" | grep -oP '\b[a-zA-Z]+[Ss]pider\b' | head -1)
+    [[ -n "$name" ]] && { echo "$name"; return; }
+
+    name=$(echo "$ua" | grep -oP '\b[a-zA-Z]+[Cc]rawler\b' | head -1)
+    [[ -n "$name" ]] && { echo "$name"; return; }
+
+    # Известные имена
+    local ua_lower
+    ua_lower=$(echo "$ua" | tr '[:upper:]' '[:lower:]')
+    for bot in curl wget python-requests go-http-client java axios scrapy l9explore; do
+        if echo "$ua_lower" | grep -q "$bot"; then
+            echo "$bot"
             return
         fi
+    done
+
+    echo ""
+}
+
+# Определение типа клиента (браузер/бот/proxy)
+classify_client() {
+    local main_ua="$1"
+    local ua_count="$2"
+
+    # Пустой UA
+    [[ -z "$main_ua" || "$main_ua" == "-" ]] && { echo "empty"; return; }
+
+    # Бот?
+    local bot_name
+    bot_name=$(extract_bot_name "$main_ua")
+    if [[ -n "$bot_name" ]]; then
+        if (( ua_count > 1 )); then
+            echo "${bot_name} (${ua_count} UA)"
+        else
+            echo "${bot_name}"
+        fi
+        return
+    fi
+
+    # Proxy (100+ разных UA)
+    if (( ua_count >= 100 )); then
+        echo "proxy (${ua_count} UA)"
+        return
+    fi
+
+    # Браузер
+    local browser=""
+    local ver=""
+    if echo "$main_ua" | grep -q "Chrome/"; then
+        ver=$(echo "$main_ua" | grep -oP 'Chrome/\K[0-9]+')
+        browser="Chrome ${ver}"
+    elif echo "$main_ua" | grep -q "Firefox/"; then
+        ver=$(echo "$main_ua" | grep -oP 'Firefox/\K[0-9]+')
+        browser="Firefox ${ver}"
+    elif echo "$main_ua" | grep -q "Safari/" && echo "$main_ua" | grep -q "Version/"; then
+        ver=$(echo "$main_ua" | grep -oP 'Version/\K[0-9]+')
+        browser="Safari ${ver}"
+    elif echo "$main_ua" | grep -q "Edg/"; then
+        ver=$(echo "$main_ua" | grep -oP 'Edg/\K[0-9]+')
+        browser="Edge ${ver}"
+    elif echo "$main_ua" | grep -q "curl"; then
+        browser="curl"
     else
-        echo "[IPv6/Local]"
+        browser="Mozilla"
+    fi
+
+    # Мобильный?
+    if echo "$main_ua" | grep -qi "mobile\|android\|iphone"; then
+        browser="${browser} Mobile"
+    fi
+
+    if (( ua_count > 1 )); then
+        echo "${browser} (${ua_count} UA)"
+    else
+        echo "${browser}"
     fi
 }
 
-# Показать статус whois в конце работы
-show_whois_status() {
-    echo -e "\n${BOLD}${WHITE}=========================================${NC}"
-    case "$WHOIS_STATUS" in
-        "available")
-            echo -e "${GREEN}✓ Геолокация IP: whois доступен, страны определяются${NC}"
-            ;;
-        "installed")
-            echo -e "${GREEN}✓ Геолокация IP: whois успешно установлен, страны определяются${NC}"
-            ;;
-        "install_failed")
-            echo -e "${YELLOW}⚠  Геолокация IP: не удалось установить whois (старая ОС/репозитории?)${NC}"
-            echo -e "${CYAN}   Для получения стран установите whois вручную${NC}"
-            ;;
-        "no_package_manager")
-            echo -e "${YELLOW}⚠  Геолокация IP: неизвестный пакетный менеджер${NC}"
-            echo -e "${CYAN}   Установите whois вручную для получения стран${NC}"
-            ;;
-        "unknown")
-            if [[ "$WHOIS_FAILED_COUNT" -gt 0 ]]; then
-                echo -e "${YELLOW}⚠  Геолокация IP: whois доступен, но $WHOIS_FAILED_COUNT IP не определились${NC}"
+# ═══════════════════════════════════════════════════════════════════════════
+#  DNS CHECKS (per-site)
+# ═══════════════════════════════════════════════════════════════════════════
+declare -A DNS_CACHE
+
+dns_check_site() {
+    local domain="$1"
+    # Пропускаем невалидные домены
+    [[ -z "$domain" || "$domain" == "-" || "$domain" == "unknown" ]] && { echo ""; return; }
+    [[ "$domain" != *.* ]] && { echo ""; return; }
+    [[ -n "${DNS_CACHE[$domain]+x}" ]] && { echo "${DNS_CACHE[$domain]}"; return; }
+
+    if ! command -v dig >/dev/null 2>&1; then
+        DNS_CACHE["$domain"]="?"
+        echo "?"
+        return
+    fi
+
+    local a_record ns_provider tag=""
+
+    # A-запись
+    a_record=$(_timeout 2 dig +short "$domain" A 2>/dev/null | head -1)
+
+    if [[ -z "$a_record" ]]; then
+        tag="→???"
+    elif [[ "$a_record" == "$SERVER_IP" ]]; then
+        tag="→SRV"
+    else
+        # Проверяем CDN
+        local cname
+        cname=$(_timeout 2 dig +short "$domain" CNAME 2>/dev/null | head -1)
+        if echo "$cname" | grep -qi "cloudflare\|akamai\|fastly\|cdn\|ddos-guard\|cloudfront\|sucuri"; then
+            tag="→CDN"
+        else
+            tag="→EXT"
+        fi
+    fi
+
+    # NS-провайдер
+    ns_provider=""
+    local ns
+    ns=$(_timeout 2 dig +short "$domain" NS 2>/dev/null | head -1)
+    if [[ -z "$ns" ]]; then
+        # Пробуем родительский домен
+        local parent
+        parent=$(echo "$domain" | awk -F. '{if(NF>2) {for(i=2;i<=NF;i++) printf "%s%s",$i,(i<NF?".":"")} else print $0}')
+        ns=$(_timeout 2 dig +short "$parent" NS 2>/dev/null | head -1)
+    fi
+
+    if [[ -n "$ns" ]]; then
+        # Определяем провайдера по NS
+        local ns_lower
+        ns_lower=$(echo "$ns" | tr '[:upper:]' '[:lower:]')
+        if   echo "$ns_lower" | grep -q "cloudflare"; then ns_provider="Cloudflare"
+        elif echo "$ns_lower" | grep -q "namecheap\|registrar-servers"; then ns_provider="Namecheap"
+        elif echo "$ns_lower" | grep -q "hetzner"; then ns_provider="Hetzner"
+        elif echo "$ns_lower" | grep -q "digitalocean"; then ns_provider="DigitalOcean"
+        elif echo "$ns_lower" | grep -q "godaddy\|domaincontrol"; then ns_provider="GoDaddy"
+        elif echo "$ns_lower" | grep -q "reg.ru\|regru"; then ns_provider="Reg.ru"
+        elif echo "$ns_lower" | grep -q "yandex"; then ns_provider="Yandex"
+        elif echo "$ns_lower" | grep -q "google"; then ns_provider="Google"
+        elif echo "$ns_lower" | grep -q "aws\|amazon"; then ns_provider="AWS"
+        else ns_provider=$(echo "$ns" | sed 's/\.$//' | awk -F. '{print $(NF-1)"."$NF}')
+        fi
+    fi
+
+    local result="${ns_provider} ${tag}"
+    DNS_CACHE["$domain"]="$result"
+    echo "$result"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN DATA COLLECTION (single awk pass)
+# ═══════════════════════════════════════════════════════════════════════════
+collect_data() {
+    spin_start "Парсинг ${#LOG_FILES[@]} лог-файлов (${PERIOD_LABEL})..."
+
+    # Определяем, нужно ли фильтровать по дате в awk
+    # Передаём cutoff timestamp в awk
+    local cutoff_ts="$CUTOFF_TS"
+
+    # Генерируем cutoff date string для сравнения (portable, не нужен mktime)
+    local cutoff_date
+    cutoff_date=$(date -d "@${cutoff_ts}" '+%d/%b/%Y:%H:%M:%S' 2>/dev/null || date -r "$cutoff_ts" '+%d/%b/%Y:%H:%M:%S' 2>/dev/null || echo "")
+
+    awk -v cutoff_str="$cutoff_date" \
+        -v skip_codes="$SKIP_CODES" \
+        -v fast="$OPT_FAST" \
+    '
+    BEGIN {
+        # Для сравнения дат строкой — конвертируем месяц в число
+        split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", months)
+        for (i=1; i<=12; i++) mon_num[months[i]] = sprintf("%02d", i)
+    }
+
+    # Конвертирует "04/Apr/2026:11:20:33" в "20260404112033" для сравнения
+    function ts_to_cmp(s,    p,d,m,y,rest) {
+        p = index(s, "[")
+        if (p) s = substr(s, p+1)
+        p = index(s, "]")
+        if (p) s = substr(s, 1, p-1)
+        # s = "04/Apr/2026:11:20:33 +0000"
+        split(s, _t, "/")
+        d = _t[1]
+        m = _t[2]
+        rest = _t[3]
+        split(rest, _t2, ":")
+        y = _t2[1]
+        if (!(m in mon_num)) return ""
+        return y mon_num[m] sprintf("%02d", d+0) _t2[2] _t2[3] _t2[4]
+    }
+
+    {
+        # Находим позицию timestamp
+        ts_str = ""
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /^\[/) {
+                ts_str = $i
+                if (i+1 <= NF && $(i+1) ~ /\+[0-9]/) ts_str = ts_str " " $(i+1)
+                break
+            }
+        }
+
+        # Фильтрация по дате (строковое сравнение)
+        if (cutoff_str != "" && ts_str != "") {
+            ts_cmp = ts_to_cmp(ts_str)
+            cutoff_cmp = ts_to_cmp("[" cutoff_str "]")
+            if (ts_cmp != "" && cutoff_cmp != "" && ts_cmp < cutoff_cmp) next
+        }
+
+        # IP - первое поле
+        ip = $1
+        if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ip !~ /:/) next
+
+        # Парсинг через split по кавычкам (наиболее надёжный для combined формата)
+        # Формат: IP - - [ts] "METHOD URI HTTP/x.x" STATUS BYTES "referer" "UA"
+        n = split($0, parts, "\"")
+        # parts[2] = "GET /uri HTTP/1.1"
+        # parts[4] = referer
+        # parts[6] = User-Agent
+        request = (n >= 2) ? parts[2] : ""
+        ua = (n >= 6) ? parts[6] : "-"
+        if (ua == "" || ua == " ") ua = "-"
+
+        # Извлекаем URI
+        split(request, req_parts, " ")
+        uri = req_parts[2]
+        if (uri == "") uri = "-"
+
+        # Статус и байты: находим после закрывающих кавычек request
+        # Ищем "STATUS BYTES" после request
+        status = ""; bytes = 0
+        # После parts[2] (request) идёт: " STATUS BYTES "
+        # Проще: пройдёмся по полям
+        found_req_end = 0
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /"$/ && found_req_end == 0) {
+                found_req_end = 1
+                status = $(i+1)
+                bytes = $(i+2)
+                if (bytes !~ /^[0-9]+$/) bytes = 0
+                break
+            }
+        }
+
+        # Пропуск мусорных кодов
+        n_skip = split(skip_codes, sc, "|")
+        for (k=1; k<=n_skip; k++) {
+            if (status == sc[k]) next
+        }
+
+        # Определяем сайт из имени файла (FILENAME)
+        site = FILENAME
+        gsub(/.*\//, "", site)
+        gsub(/-?(backend|frontend)?\.?access\.log.*/, "", site)
+        gsub(/\.log.*/, "", site)
+        if (site == "") site = "unknown"
+
+        # === Агрегация ===
+
+        # IP
+        ip_hits[ip]++
+
+        # UA per IP
+        ua_key = ip SUBSEP ua
+        if (!(ua_key in ip_ua_seen)) {
+            ip_ua_seen[ua_key] = 1
+            ip_ua_count[ip]++
+        }
+        ip_ua_hits[ua_key]++
+        if (ip_ua_hits[ua_key] > ip_ua_max_hits[ip]) {
+            ip_ua_max_hits[ip] = ip_ua_hits[ua_key]
+            ip_main_ua[ip] = ua
+        }
+
+        # Status codes
+        if (status ~ /^2/) s2xx++
+        else if (status ~ /^3/) s3xx++
+        else if (status ~ /^4/) s4xx++
+        else if (status ~ /^5/) { s5xx++; site_5xx[site]++ }
+
+        # Bytes
+        total_bytes += bytes
+        site_bytes[site] += bytes
+
+        # Hourly stats
+        if (match(ts_str, /:[0-9][0-9]:/)) {
+            h_str = substr(ts_str, RSTART+1, 2)
+            hourly[h_str + 0]++
+        }
+
+        # Per-site URI
+        if (fast != "true") {
+            site_uri[site SUBSEP uri]++
+        }
+        site_hits[site]++
+
+        # Bot detection (portable — no capture groups)
+        ua_lower = tolower(ua)
+        is_bot = 0
+        if (ua_lower ~ /bot|crawl|spider|scraper|scanner|slurp|wget|curl|python|go-http|java|axios|l9explore/) {
+            is_bot = 1
+            bot_name = ""
+            # Try to extract bot name from common patterns
+            if (ua_lower ~ /googlebot/)        bot_name = "Googlebot"
+            else if (ua_lower ~ /yandexbot/)   bot_name = "YandexBot"
+            else if (ua_lower ~ /bingbot/)     bot_name = "bingbot"
+            else if (ua_lower ~ /gptbot/)      bot_name = "GPTBot"
+            else if (ua_lower ~ /claudebot/)   bot_name = "ClaudeBot"
+            else if (ua_lower ~ /ahrefsbot/)   bot_name = "AhrefsBot"
+            else if (ua_lower ~ /semrushbot/)  bot_name = "SemrushBot"
+            else if (ua_lower ~ /dotbot/)      bot_name = "DotBot"
+            else if (ua_lower ~ /applebot/)    bot_name = "Applebot"
+            else if (ua_lower ~ /serpstatbot/) bot_name = "serpstatbot"
+            else if (ua_lower ~ /baiduspider/) bot_name = "Baiduspider"
+            else if (ua_lower ~ /bytespider/)  bot_name = "Bytespider"
+            else if (ua_lower ~ /amazonbot/)   bot_name = "Amazonbot"
+            else if (ua_lower ~ /msnbot/)      bot_name = "msnbot"
+            else if (ua_lower ~ /duckduckbot/) bot_name = "DuckDuckBot"
+            else if (ua_lower ~ /mauibot/)     bot_name = "MauiBot"
+            else if (ua_lower ~ /meta-externalagent/) bot_name = "meta-externalagent"
+            else if (ua_lower ~ /l9explore/)   bot_name = "l9explore"
+            else if (ua_lower ~ /curl/)        bot_name = "curl"
+            else if (ua_lower ~ /wget/)        bot_name = "wget"
+            else if (ua_lower ~ /python/)      bot_name = "python"
+            else if (ua_lower ~ /go-http/)     bot_name = "Go-http-client"
+            else if (ua_lower ~ /java/)        bot_name = "Java"
+            else if (ua_lower ~ /axios/)       bot_name = "axios"
+            else if (ua_lower ~ /scrapy/)      bot_name = "Scrapy"
+            else {
+                # Попытка извлечь имя бота: ищем слово с "bot/spider/crawler"
+                n2 = split(ua, ua_words, /[ \/;()]/)
+                for (w=1; w<=n2; w++) {
+                    wl = tolower(ua_words[w])
+                    if (wl ~ /bot$|spider$|crawler$|scraper$/) {
+                        bot_name = ua_words[w]
+                        break
+                    }
+                }
+                if (bot_name == "") bot_name = "unknown-bot"
+            }
+            gsub(/^ +| +$/, "", bot_name)
+            bot_hits[bot_name]++
+        }
+
+        # Traffic type
+        if (is_bot) traffic_bot++
+        else if (ua_lower ~ /mobile|android|iphone|ipad/) traffic_mobile++
+        else traffic_desktop++
+
+        total_requests++
+    }
+
+    END {
+        # === OUTPUT ===
+
+        # Summary
+        print "SUMMARY"
+        print "total_requests=" total_requests
+        print "s2xx=" s2xx+0
+        print "s3xx=" s3xx+0
+        print "s4xx=" s4xx+0
+        print "s5xx=" s5xx+0
+        print "total_bytes=" total_bytes+0
+        print "traffic_bot=" traffic_bot+0
+        print "traffic_desktop=" traffic_desktop+0
+        print "traffic_mobile=" traffic_mobile+0
+
+        # Unique IPs
+        unique_ips = 0
+        for (ip in ip_hits) unique_ips++
+        print "unique_ips=" unique_ips
+
+        # Unique bots
+        unique_bots = 0
+        for (b in bot_hits) unique_bots++
+        print "unique_bots=" unique_bots
+
+        # Sites
+        site_count = 0
+        for (s in site_hits) site_count++
+        print "site_count=" site_count
+
+        print "END_SUMMARY"
+
+        # Hourly
+        print "HOURLY"
+        for (h=0; h<=23; h++) {
+            printf "%d=%d\n", h, hourly[h]+0
+        }
+        print "END_HOURLY"
+
+        # Top IPs (unsorted — sort later)
+        print "TOP_IPS"
+        for (ip in ip_hits) {
+            # main_ua и ua_count
+            m_ua = ip_main_ua[ip]
+            u_cnt = ip_ua_count[ip]
+            gsub(/\t/, " ", m_ua)
+            printf "%d\t%s\t%s\t%d\n", ip_hits[ip], ip, m_ua, u_cnt
+        }
+        print "END_TOP_IPS"
+
+        # Bots
+        print "BOTS"
+        for (b in bot_hits) {
+            printf "%d\t%s\n", bot_hits[b], b
+        }
+        print "END_BOTS"
+
+        # Per-site
+        print "SITES"
+        for (s in site_hits) {
+            printf "SITE\t%s\t%d\t%d\t%d\n", s, site_hits[s], site_bytes[s]+0, site_5xx[s]+0
+        }
+        print "END_SITES"
+
+        # Per-site URIs
+        if (fast != "true") {
+            print "SITE_URIS"
+            for (key in site_uri) {
+                split(key, su, SUBSEP)
+                printf "%s\t%s\t%d\n", su[1], su[2], site_uri[key]
+            }
+            print "END_SITE_URIS"
+        }
+    }
+    ' "${LOG_FILES[@]}" > "${TMPDIR_WORK}/raw_data.txt" 2>/dev/null
+
+    spin_stop
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PARSE AWK OUTPUT
+# ═══════════════════════════════════════════════════════════════════════════
+declare -A SUMMARY
+declare -a HOURLY_DATA
+declare -A SITE_DATA
+
+parse_collected_data() {
+    local section=""
+    local line
+
+    while IFS= read -r line; do
+        case "$line" in
+            SUMMARY)       section="summary" ;;
+            END_SUMMARY)   section="" ;;
+            HOURLY)        section="hourly" ;;
+            END_HOURLY)    section="" ;;
+            TOP_IPS)       section="ips" ;;
+            END_TOP_IPS)   section="" ;;
+            BOTS)          section="bots" ;;
+            END_BOTS)      section="" ;;
+            SITES)         section="sites" ;;
+            END_SITES)     section="" ;;
+            SITE_URIS)     section="uris" ;;
+            END_SITE_URIS) section="" ;;
+            *)
+                case "$section" in
+                    summary)
+                        local key val
+                        key="${line%%=*}"
+                        val="${line#*=}"
+                        SUMMARY["$key"]="$val"
+                        ;;
+                    hourly)
+                        local h v
+                        h="${line%%=*}"
+                        v="${line#*=}"
+                        HOURLY_DATA[$h]="$v"
+                        ;;
+                    ips)
+                        echo "$line" >> "${TMPDIR_WORK}/top_ips.tsv"
+                        ;;
+                    bots)
+                        echo "$line" >> "${TMPDIR_WORK}/bots.tsv"
+                        ;;
+                    sites)
+                        echo "$line" >> "${TMPDIR_WORK}/sites.tsv"
+                        ;;
+                    uris)
+                        echo "$line" >> "${TMPDIR_WORK}/site_uris.tsv"
+                        ;;
+                esac
+                ;;
+        esac
+    done < "${TMPDIR_WORK}/raw_data.txt"
+
+    # Сортируем
+    [[ -f "${TMPDIR_WORK}/top_ips.tsv" ]] && sort -t$'\t' -k1 -nr "${TMPDIR_WORK}/top_ips.tsv" > "${TMPDIR_WORK}/top_ips_sorted.tsv"
+    [[ -f "${TMPDIR_WORK}/bots.tsv" ]]    && sort -t$'\t' -k1 -nr "${TMPDIR_WORK}/bots.tsv" > "${TMPDIR_WORK}/bots_sorted.tsv"
+    [[ -f "${TMPDIR_WORK}/sites.tsv" ]]   && sort -t$'\t' -k3 -nr "${TMPDIR_WORK}/sites.tsv" > "${TMPDIR_WORK}/sites_sorted.tsv"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GeoIP BATCH RESOLVE
+# ═══════════════════════════════════════════════════════════════════════════
+resolve_all_ips() {
+    [[ ! -f "${TMPDIR_WORK}/top_ips_sorted.tsv" ]] && return
+
+    spin_start "GeoIP: определение стран..."
+
+    # Извлекаем уникальные IP
+    awk -F'\t' '{print $2}' "${TMPDIR_WORK}/top_ips_sorted.tsv" | head -n "$OPT_TOP_N" > "${TMPDIR_WORK}/ips_to_resolve.txt"
+
+    # Батч-резолв
+    geo_batch_resolve "${TMPDIR_WORK}/ips_to_resolve.txt"
+
+    spin_stop
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SUBNET AGGREGATION
+# ═══════════════════════════════════════════════════════════════════════════
+aggregate_subnets() {
+    [[ ! -f "${TMPDIR_WORK}/top_ips_sorted.tsv" ]] && return
+
+    awk -F'\t' '
+    {
+        hits = $1; ip = $2
+        # /24 for IPv4
+        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            n = split(ip, oct, ".")
+            subnet = oct[1]"."oct[2]"."oct[3]".0/24"
+            subnet_hits[subnet] += hits
+            subnet_ips[subnet]++
+        }
+    }
+    END {
+        for (s in subnet_hits) {
+            printf "%d\t%d\t%s\n", subnet_hits[s], subnet_ips[s], s
+        }
+    }' "${TMPDIR_WORK}/top_ips_sorted.tsv" | sort -t$'\t' -k1 -nr > "${TMPDIR_WORK}/subnets.tsv"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════
+render_summary() {
+    print_header "Сводка"
+
+    local period_start period_end
+    period_start=$(date -d "@${CUTOFF_TS}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$CUTOFF_TS" '+%Y-%m-%d %H:%M' 2>/dev/null)
+    period_end=$(date '+%Y-%m-%d %H:%M')
+
+    echo "  Период (сервер):     ${period_start} — ${period_end} (${SERVER_TZ}, ${PERIOD_LABEL})"
+    echo "  Всего запросов:      $(fmt_num "${SUMMARY[total_requests]:-0}")"
+    echo "  Трафик:              ${SUMMARY[traffic_bot]:-0} bot  /  ${SUMMARY[traffic_desktop]:-0} desktop  /  ${SUMMARY[traffic_mobile]:-0} mobile"
+    echo "  Статус-коды:         ${G}${SUMMARY[s2xx]:-0} 2xx${NC}  /  ${C}${SUMMARY[s3xx]:-0} 3xx${NC}  /  ${Y}${SUMMARY[s4xx]:-0} 4xx${NC}  /  ${R}${SUMMARY[s5xx]:-0} 5xx${NC}"
+    echo "  Объём:               $(fmt_bytes "${SUMMARY[total_bytes]:-0}")"
+    echo "  Уникальных IP:       $(fmt_num "${SUMMARY[unique_ips]:-0}")"
+    echo "  Уникальных ботов:    ${SUMMARY[unique_bots]:-0}"
+    echo "  Сайтов:              ${SUMMARY[site_count]:-0}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: CHART
+# ═══════════════════════════════════════════════════════════════════════════
+render_chart() {
+    print_header "Запросы / час"
+
+    # Находим максимум
+    local max_val=0 h
+    for h in $(seq 0 23); do
+        local v=${HOURLY_DATA[$h]:-0}
+        (( v > max_val )) && max_val=$v
+    done
+
+    [[ $max_val -eq 0 ]] && { echo "  Нет данных."; return; }
+
+    # Ширина Y-axis метки (для числа с пробелами-разделителями)
+    local y_label_w=8
+
+    # ASCII chart (12 строк высотой)
+    local rows=12
+    local r
+
+    for (( r=rows; r>=1; r-- )); do
+        local threshold=$(( max_val * r / rows ))
+        if (( r == rows )); then
+            printf "  %${y_label_w}s ┤" "$(fmt_num $max_val)"
+        elif (( r == rows/2 )); then
+            printf "  %${y_label_w}s ┤" "$(fmt_num $(( max_val / 2 )))"
+        elif (( r == 1 )); then
+            printf "  %${y_label_w}s ┤" "0"
+        else
+            printf "  %${y_label_w}s ┤" ""
+        fi
+
+        for h in $(seq 0 23); do
+            local v=${HOURLY_DATA[$h]:-0}
+            local bar_height=$(( v * rows / max_val ))
+            if (( bar_height >= r )); then
+                printf "${G}█${NC}"
+            else
+                printf " "
             fi
-            ;;
-    esac
-    
-    if [[ "$WHOIS_STATUS" == "install_failed" || "$WHOIS_STATUS" == "no_package_manager" ]]; then
-        echo -e "${WHITE}   Команды для установки:${NC}"
-        echo -e "${CYAN}   Ubuntu/Debian: apt-get install whois${NC}"
-        echo -e "${CYAN}   CentOS/RHEL:   yum install whois${NC}"
-        echo -e "${CYAN}   Fedora:        dnf install whois${NC}"
-    fi
-    echo -e "${BOLD}${WHITE}=========================================${NC}"
+            printf "  "
+        done
+        echo ""
+    done
+
+    # X-axis
+    printf "  %${y_label_w}s └" ""
+    for h in $(seq 0 23); do
+        printf "───"
+    done
+    echo ""
+    printf "  %${y_label_w}s  " ""
+    for h in $(seq 0 23); do
+        printf "%-3d" "$h"
+    done
+    echo ""
 }
 
-# Основной анализ при запуске
-clear
-printf "\033[1m\033[%sm==============================\n" "32"
-printf " DDoSer: DDoS Protection - Анализ логов на предмет атак\n"
-echo -e " ${CYAN}Создано Vladislav Pavlovich для технической поддержки. По вопросам в TG @sysadminctl${NC}"
-printf " ОС: %s %s\n" "$os_name" "$os_version"
-printf " Панель: %s\n" "$CONTROL_PANEL"
-printf "==============================\033[0m\n"
-if [[ "$panel_login_url" != "" ]]; then
-    echo -e "${CYAN}Ссылка для входа в панель: $panel_login_url${NC}"
-fi
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: TOP IPs
+# ═══════════════════════════════════════════════════════════════════════════
+render_top_ips() {
+    [[ ! -f "${TMPDIR_WORK}/top_ips_sorted.tsv" ]] && return
 
-analyze_logs
-analyze_connections
-show_load
-show_whois_status
+    print_header "Топ ${OPT_TOP_N} IP"
 
-# Меню для дальнейших действий
-while true; do
-    echo -e "\n${BOLD}${WHITE}+------------------------------------------+${NC}"
-    echo -e "${BOLD}${WHITE}|              МЕНЮ ДЕЙСТВИЙ               |${NC}"
-    echo -e "${BOLD}${WHITE}+------------------------------------------+${NC}"
-    echo -e "${BOLD}${WHITE}| ${YELLOW}1${WHITE}. Заблокировать IP                    |${NC}"
-    echo -e "${BOLD}${WHITE}| ${MAGENTA}2${WHITE}. Заблокировать UA                    |${NC}"
-    echo -e "${BOLD}${WHITE}| ${CYAN}3${WHITE}. Сохранить отчёт                     |${NC}"
-    echo -e "${BOLD}${WHITE}| ${BLUE}4${WHITE}. Показать ссылку на панель           |${NC}"
-    echo -e "${BOLD}${WHITE}| ${MAGENTA}5${WHITE}. Мониторинг в реальном времени       |${NC}"
-    echo -e "${BOLD}${WHITE}| ${GREEN}6${WHITE}. Повторный анализ                    |${NC}"
-    echo -e "${BOLD}${WHITE}| ${RED}0${WHITE}. Выход                               |${NC}"
-    echo -e "${BOLD}${WHITE}+------------------------------------------+${NC}"
-    echo -ne "${BOLD}Ваш выбор: ${NC}"
-    read choice
-    case $choice in
-        1)
-            block_ip_auto
-            ;;
-        2)
-            block_user_agent
-            ;;
-        3)
-            save_report
-            echo -e "${GREEN}Отчёт сохранён в $LOG_FILE${NC}"
-            ;;
-        4)
-            echo -e "${CYAN}Ссылка для входа в панель: $panel_login_url${NC}"
-            ;;
-        5)
-            real_time_monitoring
-            ;;
-        6)
-            echo -e "${YELLOW}Повторный анализ...${NC}"
-            analyze_logs
-            analyze_connections
-            show_load
-            show_whois_status
-            ;;
-        0)
-            echo -e "${GREEN}Спасибо за использование DDoSer! До свидания.${NC}"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}Неверный выбор! Пожалуйста, выберите от 0 до 6.${NC}"
-            ;;
-    esac
-done
+    printf "  ${BOLD}%-9s | %-39s | %-30s | %s${NC}\n" "HITS" "IP" "COUNTRY" "CLIENT"
+    print_separator
+
+    local count=0
+    while IFS=$'\t' read -r hits ip main_ua ua_count; do
+        (( count >= OPT_TOP_N )) && break
+
+        # GeoIP
+        local geo_str
+        geo_str=$(geo_lookup "$ip")
+        local cc
+        cc=$(geo_country_code "$geo_str")
+        local cn
+        cn=$(geo_country_name "$geo_str")
+
+        # Цвет страны
+        local country_raw="${cc}, ${cn}"
+        local country_display
+        if [[ "$ip" == "$SERVER_IP" ]]; then
+            country_display="${Y}THIS SERVER${NC}"
+            country_raw="THIS SERVER"
+        elif is_safe_country "$cc"; then
+            country_display="${G}${country_raw}${NC}"
+        else
+            country_display="${R}${country_raw}${NC}"
+        fi
+
+        # Клиент
+        local client
+        client=$(classify_client "$main_ua" "$ua_count")
+
+        # Padding вручную (без ANSI кодов в %-Ns)
+        local pad_country=$(( 30 - ${#country_raw} ))
+        (( pad_country < 0 )) && pad_country=0
+        local country_padded="${country_display}$(printf '%*s' $pad_country '')"
+
+        printf "  %-9s | %-39s | %s | %s\n" "$hits" "$ip" "$country_padded" "$client"
+        count=$((count + 1))
+    done < "${TMPDIR_WORK}/top_ips_sorted.tsv"
+
+    print_separator
+    echo "  Всего: ${SUMMARY[unique_ips]:-0} уникальных IP, ${SUMMARY[total_requests]:-0} запросов"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: TOP SUBNETS
+# ═══════════════════════════════════════════════════════════════════════════
+render_top_subnets() {
+    [[ ! -f "${TMPDIR_WORK}/subnets.tsv" ]] && return
+
+    print_header "Топ 10 подсетей"
+
+    printf "  ${BOLD}%-11s | %-6s | %-28s | %s${NC}\n" "HITS" "IPs" "SUBNET" "COUNTRY"
+    print_separator
+
+    local count=0
+    while IFS=$'\t' read -r hits ips subnet; do
+        (( count >= 10 )) && break
+
+        local base_ip
+        base_ip=$(echo "$subnet" | sed 's|/24||' | sed 's|\.0$|.1|')
+        local geo_str
+        geo_str=$(geo_lookup "$base_ip")
+        local cc cn
+        cc=$(geo_country_code "$geo_str")
+        cn=$(geo_country_name "$geo_str")
+
+        local country_raw="${cc}, ${cn}"
+        local country_display
+        if is_safe_country "$cc"; then
+            country_display="${G}${country_raw}${NC}"
+        else
+            country_display="${R}${country_raw}${NC}"
+        fi
+
+        printf "  %-11s | %-6s | %-28s | %s\n" "$hits" "$ips" "$subnet" "$country_display"
+        count=$((count + 1))
+    done < "${TMPDIR_WORK}/subnets.tsv"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: TOP BOTS
+# ═══════════════════════════════════════════════════════════════════════════
+render_top_bots() {
+    [[ ! -f "${TMPDIR_WORK}/bots_sorted.tsv" ]] && return
+
+    local bot_top=30
+
+    print_header "Топ ${bot_top} ботов"
+
+    printf "  ${BOLD}%-11s %s${NC}\n" "HITS" "BOT"
+    print_separator
+
+    local count=0
+    while IFS=$'\t' read -r hits bot_name; do
+        (( count >= bot_top )) && break
+
+        # Цвет бота
+        local color=""
+        local cls
+        cls=$(bot_class "$bot_name")
+        if (( hits >= 1000 )); then
+            case "$cls" in
+                green)  color="$G" ;;
+                yellow) color="$Y" ;;
+                red)    color="$R" ;;
+            esac
+        fi
+
+        printf "  %-11s${color}%-40s${NC}\n" "$hits" "$bot_name"
+        count=$((count + 1))
+    done < "${TMPDIR_WORK}/bots_sorted.tsv"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: PER-SITE URIs
+# ═══════════════════════════════════════════════════════════════════════════
+render_site_uris() {
+    [[ "$OPT_FAST" == "true" ]] && return
+    [[ ! -f "${TMPDIR_WORK}/sites_sorted.tsv" ]] && return
+
+    local sites_top=10
+
+    print_header "Топ ${sites_top} сайтов по запросам (URI топ-${OPT_URI_N})"
+
+    # sites_sorted.tsv format: SITE\tname\thits\tbytes\t5xx
+    local site_count=0
+    while IFS=$'\t' read -r _prefix site_name site_hits site_bytes site_5xx; do
+        [[ -z "$site_name" || "$site_name" == "-" || "$site_name" == "unknown" ]] && continue
+        (( site_count >= sites_top )) && break
+
+        local bytes_fmt
+        bytes_fmt=$(fmt_bytes "${site_bytes:-0}")
+        local extra=""
+        (( ${site_5xx:-0} > 0 )) && extra="${R}${site_5xx} 5xx${NC} · "
+        extra="${extra}${bytes_fmt} · ${site_hits} req"
+
+        echo ""
+        printf "  ${BOLD}${W}%-60s${NC} %s\n" "$site_name" "$extra"
+
+        # DNS info
+        local dns_info
+        dns_info=$(dns_check_site "$site_name" 2>/dev/null)
+        [[ -n "$dns_info" && "$dns_info" != "?" ]] && echo "      ${DIM}${dns_info}${NC}"
+
+        print_separator
+
+        # URIs для этого сайта
+        if [[ -f "${TMPDIR_WORK}/site_uris.tsv" ]]; then
+            grep -P "^${site_name}\t" "${TMPDIR_WORK}/site_uris.tsv" 2>/dev/null | \
+                sort -t$'\t' -k3 -nr | head -n "$OPT_URI_N" | \
+                while IFS=$'\t' read -r _s uri uri_hits; do
+                    printf "  %-9s%s\n" "$uri_hits" "$uri"
+                done
+        fi
+
+        site_count=$((site_count + 1))
+    done < "${TMPDIR_WORK}/sites_sorted.tsv"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RENDER: RECOMMENDATIONS
+# ═══════════════════════════════════════════════════════════════════════════
+render_recommendations() {
+    [[ "$OPT_QUIET" == "true" ]] && return
+
+    print_header "Рекомендации"
+    echo "  ${DIM}Проверьте перед применением. Используйте на свое усмотрение.${NC}"
+
+    local rec_num=1
+
+    # 1. Блокировка нежелательных ботов через nginx
+    local bad_bots=""
+    if [[ -f "${TMPDIR_WORK}/bots_sorted.tsv" ]]; then
+        while IFS=$'\t' read -r hits bot_name; do
+            local cls
+            cls=$(bot_class "$bot_name")
+            if [[ "$cls" == "red" ]] && (( hits >= 50 )); then
+                [[ -n "$bad_bots" ]] && bad_bots="${bad_bots}|"
+                bad_bots="${bad_bots}${bot_name}"
+            fi
+        done < "${TMPDIR_WORK}/bots_sorted.tsv"
+    fi
+
+    if [[ -n "$bad_bots" ]]; then
+        # Определяем путь для конфига
+        local conf_path=""
+        case "$CONTROL_PANEL" in
+            ispmanager) conf_path="/etc/nginx/vhosts-includes/block-bots.conf" ;;
+            fastpanel)  conf_path="/etc/nginx/fastpanel2-includes/block-bots.conf" ;;
+            hestia)     conf_path="/etc/nginx/conf.d/block-bots.conf" ;;
+            *)          conf_path="/etc/nginx/conf.d/block-bots.conf" ;;
+        esac
+
+        echo ""
+        echo "  ${BOLD}[${rec_num}] Блокировка нежелательных ботов (nginx):${NC}"
+        echo "   Файл: ${C}${conf_path}${NC}"
+        echo ""
+        echo "   ${Y}if (\$http_user_agent ~* (${bad_bots})) {${NC}"
+        echo "   ${Y}    return 444;${NC}"
+        echo "   ${Y}}${NC}"
+        echo ""
+        echo "   ${DIM}Применить: nginx -t && systemctl reload nginx${NC}"
+        rec_num=$((rec_num + 1))
+    fi
+
+    # 2. Блокировка подозрительных подсетей через iptables
+    if [[ -f "${TMPDIR_WORK}/subnets.tsv" ]]; then
+        local suspicious_subnets=""
+        local count=0
+        while IFS=$'\t' read -r hits ips subnet; do
+            (( count >= 5 )) && break
+            (( hits < 500 )) && continue
+
+            local base_ip
+            base_ip=$(echo "$subnet" | sed 's|/24||' | sed 's|\.0$|.1|')
+            local geo_str
+            geo_str=$(geo_lookup "$base_ip")
+            local cc
+            cc=$(geo_country_code "$geo_str")
+
+            if ! is_safe_country "$cc"; then
+                [[ -n "$suspicious_subnets" ]] && suspicious_subnets="${suspicious_subnets}\n"
+                suspicious_subnets="${suspicious_subnets}   iptables -I INPUT -s ${subnet} -j DROP  # ${cc} (${hits} запросов)"
+                count=$((count + 1))
+            fi
+        done < "${TMPDIR_WORK}/subnets.tsv"
+
+        if [[ -n "$suspicious_subnets" ]]; then
+            echo ""
+            echo "  ${BOLD}[${rec_num}] Блокировка подозрительных подсетей (iptables):${NC}"
+            echo -e "$suspicious_subnets"
+            echo ""
+            echo "   ${DIM}Сохранить правила: iptables-save > /etc/iptables/rules.v4${NC}"
+            rec_num=$((rec_num + 1))
+        fi
+    fi
+
+    # 3. Защита wp-login / xmlrpc
+    local has_wp=false
+    if [[ -f "${TMPDIR_WORK}/site_uris.tsv" ]]; then
+        grep -q "wp-login\|xmlrpc" "${TMPDIR_WORK}/site_uris.tsv" 2>/dev/null && has_wp=true
+    fi
+
+    if [[ "$has_wp" == "true" ]]; then
+        echo ""
+        echo "  ${BOLD}[${rec_num}] Защита WordPress (wp-login.php, xmlrpc.php):${NC}"
+        echo "   ${Y}location = /xmlrpc.php { return 444; }${NC}"
+        echo "   ${Y}location = /wp-login.php {${NC}"
+        echo "   ${Y}    limit_req zone=login burst=3 nodelay;${NC}"
+        echo "   ${Y}    # или ограничить по IP:${NC}"
+        echo "   ${Y}    # allow YOUR.IP.HERE;${NC}"
+        echo "   ${Y}    # deny all;${NC}"
+        echo "   ${Y}}${NC}"
+        rec_num=$((rec_num + 1))
+    fi
+
+    # 4. Блокировка пустых User-Agent
+    local empty_ua_hits=0
+    if [[ -f "${TMPDIR_WORK}/top_ips_sorted.tsv" ]]; then
+        while IFS=$'\t' read -r hits ip main_ua ua_count; do
+            [[ "$main_ua" == "-" || -z "$main_ua" ]] && empty_ua_hits=$((empty_ua_hits + hits))
+        done < <(head -n "$OPT_TOP_N" "${TMPDIR_WORK}/top_ips_sorted.tsv")
+    fi
+
+    if (( empty_ua_hits > 100 )); then
+        echo ""
+        echo "  ${BOLD}[${rec_num}] Блокировка пустых User-Agent (${empty_ua_hits} запросов):${NC}"
+        echo "   ${Y}if (\$http_user_agent = \"\") { return 444; }${NC}"
+        rec_num=$((rec_num + 1))
+    fi
+
+    # 5. Топ IP для ручной блокировки
+    if [[ -f "${TMPDIR_WORK}/top_ips_sorted.tsv" ]]; then
+        local top3_block=""
+        local count=0
+        while IFS=$'\t' read -r hits ip main_ua ua_count; do
+            (( count >= 3 )) && break
+            (( hits < 1000 )) && continue
+            [[ "$ip" == "$SERVER_IP" ]] && continue
+
+            local geo_str
+            geo_str=$(geo_lookup "$ip")
+            local cc
+            cc=$(geo_country_code "$geo_str")
+
+            top3_block="${top3_block}   iptables -I INPUT -s ${ip} -j DROP  # ${cc} (${hits} запросов)\n"
+            count=$((count + 1))
+        done < "${TMPDIR_WORK}/top_ips_sorted.tsv"
+
+        if [[ -n "$top3_block" ]]; then
+            echo ""
+            echo "  ${BOLD}[${rec_num}] Блокировка самых активных IP (iptables):${NC}"
+            echo -e "$top3_block"
+            rec_num=$((rec_num + 1))
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+main() {
+    # 1. Detect panel
+    detect_panel
+
+    # 2. Banner
+    if [[ "$SCRIPT_MODE" != "true" ]]; then
+        clear 2>/dev/null
+        echo ""
+        echo "  ${BOLD}${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo "  ${BOLD}${W}  DDoSer ${VERSION}${NC} — Анализ access-логов на предмет DDoS-атак"
+        echo "  ${C}  Создано Vladislav Pavlovich · TG @sysadminctl${NC}"
+        echo "  ${BOLD}${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+    fi
+
+    # 3. Collect log files
+    collect_log_files
+    if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
+        die "Не найдено лог-файлов. Панель: ${CONTROL_PANEL}. Проверьте пути к логам."
+    fi
+
+    # Prompt на больших серверах
+    if [[ "$OPT_YES" != "true" ]] && [[ ${#LOG_FILES[@]} -gt 30 ]]; then
+        echo "  ${Y}${#LOG_FILES[@]} лог-файлов обнаружено. Анализ может занять время.${NC}"
+        echo ""
+        echo "  Для быстрого запуска используйте: ${C}bash ddoser.sh -fqy${NC}"
+        echo ""
+        read -p "  Продолжить? [Y/n] " answer
+        [[ "$answer" =~ ^[Nn] ]] && exit 0
+
+        if [[ "$OPT_FAST" != "true" ]] && [[ ${#LOG_FILES[@]} -gt 50 ]]; then
+            read -p "  URI по сайтам только для топ-10? (полный список может быть длинным) [Y/n] " answer2
+            [[ ! "$answer2" =~ ^[Nn] ]] && OPT_URI_N=10
+        fi
+    fi
+
+    # 4. Dependencies
+    ensure_dependencies
+
+    # 5. System info
+    collect_system_info
+
+    # 6. Validate log format (first non-empty line)
+    local first_line
+    first_line=$(head -1 "${LOG_FILES[0]}" 2>/dev/null)
+    if [[ -n "$first_line" ]] && ! echo "$first_line" | grep -qP '^\S+ \S+ \S+ \['; then
+        warn "Формат логов может быть нестандартным. Результаты могут быть неточными."
+    fi
+
+    # 7. Collect data (single awk pass)
+    collect_data
+
+    # 8. Parse
+    parse_collected_data
+
+    # 9. GeoIP batch resolve
+    resolve_all_ips
+
+    # 10. Subnet aggregation
+    aggregate_subnets
+
+    # 11. DNS pre-collect (if not fast)
+    if [[ "$OPT_FAST" != "true" ]] && [[ -f "${TMPDIR_WORK}/sites_sorted.tsv" ]]; then
+        spin_start "DNS-проверки сайтов..."
+        while IFS=$'\t' read -r _ site_name _ _ _; do
+            dns_check_site "$site_name" >/dev/null 2>&1
+        done < <(head -n 20 "${TMPDIR_WORK}/sites_sorted.tsv")
+        spin_stop
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  RENDER (всё в буфер)
+    # ═══════════════════════════════════════════════════════════════════
+    local output_file="${TMPDIR_WORK}/report.txt"
+    {
+        render_system_info
+        render_summary
+        render_chart
+        render_top_ips
+        render_top_subnets
+        render_top_bots
+
+        # Per-site URIs
+        if [[ "$OPT_FAST" != "true" ]]; then
+            render_site_uris
+        fi
+
+        render_recommendations
+
+        # Footer
+        echo ""
+        local total_req="${SUMMARY[total_requests]:-0}"
+        local unique_ips="${SUMMARY[unique_ips]:-0}"
+        local site_count="${SUMMARY[site_count]:-0}"
+        local bw
+        bw=$(fmt_bytes "${SUMMARY[total_bytes]:-0}")
+        echo "  ${DIM}${total_req} req, ${unique_ips} IPs, ${site_count} сайтов, ${bw} трафик${NC}"
+        echo ""
+    } > "$output_file"
+
+    # Output
+    cat "$output_file"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RUN
+# ═══════════════════════════════════════════════════════════════════════════
+main

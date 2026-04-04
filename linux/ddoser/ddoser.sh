@@ -6,7 +6,7 @@
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 set -o pipefail
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.0.1"
 readonly SCRIPT_NAME="DDoSer"
 
 # Подавление ошибок — скрипт должен работать даже при отсутствии утилит
@@ -898,6 +898,9 @@ collect_data() {
         split(request, req_parts, " ")
         uri = req_parts[2]
         if (uri == "") uri = "-"
+
+        # Обрезаем query string для агрегации (? и всё после)
+        sub(/\?.*/, "", uri)
 
         # Статус и байты из parts[3]: " STATUS BYTES " (между request и referer)
         status = ""; bytes = 0

@@ -1168,12 +1168,22 @@ delete_fastpanel_site() {
 
 delete_fastpanel_database() {
     local db="$1"
+    # Сначала пробуем через mogwai (если команда поддерживается)
     local id
     id=$(mogwai databases list 2>/dev/null | awk -v d="$db" 'NR>1 && $2==d {print $1}') || true
     if [[ -n "$id" ]]; then
-        dr mogwai databases delete --id="$id" >>"$LOG_FILE" 2>&1 \
-            && log_info "[откат] БД $db удалена" \
+        if dr mogwai databases delete --id="$id" >>"$LOG_FILE" 2>&1; then
+            log_info "[откат] БД $db удалена через mogwai"
+            return 0
+        fi
+    fi
+    # Fallback: напрямую через MySQL
+    if mysql -e "USE \`${db}\`;" &>/dev/null; then
+        dr mysql -e "DROP DATABASE \`${db}\`;" >>"$LOG_FILE" 2>&1 \
+            && log_info "[откат] БД $db удалена через MySQL" \
             || log_warning "[откат] Не удалось удалить БД $db"
+    else
+        log_info "[откат] БД $db не найдена, пропускаем"
     fi
 }
 
@@ -1621,12 +1631,15 @@ copy_site() {
     if $DRY_RUN; then
         log_info "[DRY-RUN] rsync -a --info=progress2 '$src_path/' '$new_site_path/'"
     else
+        # Пайп с grep может вернуть 1 если нет совпадений — используем PIPESTATUS[0]
         rsync -a --info=progress2 "$src_path/" "$new_site_path/" 2>&1 \
-            | tee -a "$LOG_FILE" | grep -E 'to-check|total size' | tail -2 >&2 || {
-            log_error "Ошибка rsync!"
+            | tee -a "$LOG_FILE" | grep -E 'to-check|total size' | tail -2 >&2 || true
+        local rsync_rc="${PIPESTATUS[0]}"
+        if [[ $rsync_rc -ne 0 ]]; then
+            log_error "Ошибка rsync (код: $rsync_rc)!"
             do_rollback "file_copy" "$new_owner" "$new_site" "$new_db_name"
             return 1
-        }
+        fi
     fi
 
     # Права доступа

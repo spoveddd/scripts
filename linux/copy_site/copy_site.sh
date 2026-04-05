@@ -154,10 +154,15 @@ _row() {
     local label="$1" value="$2" target="${3:-18}"
     local byte_len=${#label}
     local extra_bytes
+    # Считаем continuation-байты UTF-8 (0x80-0xBF) — они не дают визуальной ширины.
+    # Стрипаем пробелы из вывода wc -l, иначе bash-арифметика падает.
     extra_bytes=$(printf '%s' "$label" | LC_ALL=C grep -oP '[\x80-\xBF]' 2>/dev/null | wc -l || echo 0)
+    extra_bytes="${extra_bytes//[[:space:]]/}"
+    [[ -z "$extra_bytes" || ! "$extra_bytes" =~ ^[0-9]+$ ]] && extra_bytes=0
     local vis_len=$(( byte_len - extra_bytes ))
     local pad=$(( target - vis_len ))
     [[ $pad -lt 1 ]] && pad=1
+    # %*s с шириной pad и пустой строкой печатает ровно pad пробелов
     printf "  ${BOLD}%s${NC}%*s%s\n" "$label" "$pad" "" "$value"
 }
 

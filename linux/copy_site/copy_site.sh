@@ -1101,7 +1101,10 @@ fp_user_exists() {
 }
 
 fp_site_exists() {
-    mogwai sites list 2>/dev/null | awk 'NR>1 {print $2}' | grep -qx "$1"
+    local domain="$1" list
+    # Захватываем вывод целиком (|| true защищает от pipefail при ошибке mogwai)
+    list=$(mogwai sites list 2>/dev/null) || true
+    echo "$list" | awk -v d="$domain" 'NR>1 && $2==d {found=1} END {exit !found}'
 }
 
 fp_get_site_id() {
@@ -1155,13 +1158,24 @@ create_fastpanel_site() {
             local email
             email=$(choose_admin_email "$domain")
             log_info "Выпускаю Let's Encrypt SSL для $domain..."
+            # Небольшая пауза — nginx должен перезагрузиться после создания сайта
+            sleep 3
             local ssl_out
             ssl_out=$(dr mogwai certificates create-le \
                 --server-name="$domain" --email="$email" 2>&1) || true
-            if echo "$ssl_out" | grep -qiE "Cannot create|error|err:"; then
-                log_warning "SSL не выпущен: можно сделать позже в FastPanel"
-            else
+            # Всегда пишем вывод в лог — чтобы понять причину ошибки
+            echo "$ssl_out" >> "$LOG_FILE"
+            if echo "$ssl_out" | grep -qiE "success|created|issued|certificate"; then
                 log_success "SSL выпущен для $domain"
+            elif echo "$ssl_out" | grep -qiE "error|err:|failed|Cannot|not found"; then
+                local ssl_err
+                ssl_err=$(echo "$ssl_out" | grep -iE "error|err:|failed|Cannot" | head -1)
+                log_warning "SSL не выпущен: ${ssl_err:-см. лог}"
+                log_warning "Запустите вручную: mogwai certificates create-le --server-name=$domain --email=$email"
+            else
+                # Неизвестный вывод — логируем и считаем неудачей
+                log_warning "SSL: неожиданный ответ mogwai — проверьте лог"
+                log_warning "Запустите вручную: mogwai certificates create-le --server-name=$domain --email=$email"
             fi
         fi
         return 0
@@ -1174,11 +1188,16 @@ create_fastpanel_site() {
 create_fastpanel_database() {
     local owner="$1" db="$2" db_user="$3" db_pass="$4"
     log_info "Создаю БД $db в FastPanel..."
-    if dr mogwai databases create --server=1 \
-        -n "$db" -o "$owner" -u "$db_user" -p "$db_pass" >>"$LOG_FILE" 2>&1; then
+    local db_out
+    db_out=$(dr mogwai databases create --server=1 \
+        -n "$db" -o "$owner" -u "$db_user" -p "$db_pass" 2>&1) || true
+    echo "$db_out" >> "$LOG_FILE"
+    if echo "$db_out" | grep -qiE "success|created"; then
         log_success "БД $db создана в FastPanel"
     else
-        log_error "Ошибка создания БД $db в FastPanel"
+        local db_err
+        db_err=$(echo "$db_out" | grep -iE "error|err:" | head -1)
+        log_error "Ошибка создания БД $db в FastPanel: ${db_err:-см. лог}"
         return 1
     fi
 }
@@ -1620,6 +1639,13 @@ copy_site() {
         fi
 
         validate_db_name "$new_db_name"
+
+        # Проверяем, что БД с таким именем ещё не существует
+        if mysql -e "USE \`${new_db_name}\`;" &>/dev/null; then
+            log_error "БД '$new_db_name' уже существует в MySQL — задайте другое имя через 'Изменить параметры БД'"
+            do_rollback "site_created" "$new_owner" "$new_site" ""
+            return 1
+        fi
 
         # Создаём дамп исходной БД
         TEMP_DUMP_FILE=$(create_db_dump "$old_db_name") || {

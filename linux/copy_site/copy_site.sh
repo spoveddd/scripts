@@ -28,9 +28,9 @@ _SELF="${BASH_SOURCE[0]##*/}"
 [[ "$_SELF" =~ ^[0-9]+$ ]] && _SELF="copy_site.sh"
 
 # ─── Цвета ───────────────────────────────────────────────────
-RED='\033[0;31m';   GREEN='\033[0;32m';  YELLOW='\033[1;33m'
-BLUE='\033[0;34m';  CYAN='\033[0;36m';   BOLD='\033[1m'
-WHITE='\033[1;37m'; DIM='\033[2m';        NC='\033[0m'
+RED=$'\033[0;31m';   GREEN=$'\033[0;32m';  YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m';  CYAN=$'\033[0;36m';   BOLD=$'\033[1m'
+WHITE=$'\033[1;37m'; DIM=$'\033[2m';        NC=$'\033[0m'
 
 # ─── Глобальные переменные ───────────────────────────────────
 LOG_FILE="/var/log/site_copy_$(date +%Y%m%d_%H%M%S).log"
@@ -151,18 +151,18 @@ show_header() {
 # printf %-Ns считает байты, а не символы — поэтому считаем continuation-байты (0x80-0xBF)
 # и компенсируем разницу между байтовой и визуальной шириной.
 _row() {
-    local label="$1" value="$2" target="${3:-18}"
-    local byte_len=${#label}
-    local extra_bytes
-    # Считаем continuation-байты UTF-8 (0x80-0xBF) — они не дают визуальной ширины.
-    # Стрипаем пробелы из вывода wc -l, иначе bash-арифметика падает.
+    local label="$1" value="$2" col="${3:-20}"
+    local byte_len extra_bytes vis_len pad
+    # wc -c считает байты независимо от локали (${#} в UTF-8 локали считает символы)
+    byte_len=$(printf '%s' "$label" | wc -c)
+    byte_len="${byte_len//[[:space:]]/}"
+    # Continuation-байты (0x80-0xBF) не имеют визуальной ширины — вычитаем их
     extra_bytes=$(printf '%s' "$label" | LC_ALL=C grep -oP '[\x80-\xBF]' 2>/dev/null | wc -l || echo 0)
     extra_bytes="${extra_bytes//[[:space:]]/}"
     [[ -z "$extra_bytes" || ! "$extra_bytes" =~ ^[0-9]+$ ]] && extra_bytes=0
-    local vis_len=$(( byte_len - extra_bytes ))
-    local pad=$(( target - vis_len ))
+    vis_len=$(( byte_len - extra_bytes ))
+    pad=$(( col - vis_len ))
     [[ $pad -lt 1 ]] && pad=1
-    # %*s с шириной pad и пустой строкой печатает ровно pad пробелов
     printf "  ${BOLD}%s${NC}%*s%s\n" "$label" "$pad" "" "$value"
 }
 

@@ -1,8 +1,8 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  Site Copy Script v4.0                                      ║
-# ║  Поддержка: FastPanel · ISPManager · Hestia                 ║
-# ║  Автор: Vladislav Pavlovich  |  Telegram: @femid00           ║
+# ║  Site Copy Script v4.0                                       ║
+# ║  Поддержка: FastPanel · ISPManager · Hestia                  ║
+# ║  Автор: Vladislav Pavlovich  |  Telegram: @sysadminctl       ║
 # ╚══════════════════════════════════════════════════════════════╝
 #
 # Использование:
@@ -22,6 +22,10 @@
 #   ./copy_site.sh                          # интерактивный режим
 
 set -eo pipefail
+
+# Корректное имя скрипта (при запуске через bash <(curl ...) $0 = /dev/fd/63)
+_SELF="${BASH_SOURCE[0]##*/}"
+[[ "$_SELF" =~ ^[0-9]+$ ]] && _SELF="copy_site.sh"
 
 # ─── Цвета ───────────────────────────────────────────────────
 RED='\033[0;31m';   GREEN='\033[0;32m';  YELLOW='\033[1;33m'
@@ -59,7 +63,7 @@ DNS_SKIP=false
 usage() {
     cat >&2 <<EOF
 
-Использование: $(basename "$0") [OPTIONS] [SOURCE TARGET]
+Использование: $_SELF [OPTIONS] [SOURCE TARGET]
 
   SOURCE          Домен исходного сайта (например: site.ru)
   TARGET          Домен нового сайта    (например: copy.ru)
@@ -132,7 +136,7 @@ show_header() {
     printf "\n"
     printf "  ${BOLD}${GREEN}%s${NC}\n" "$line"
     printf "  ${BOLD}${WHITE}  copy_site.sh v4.0${NC} — инструмент удобного копирования сайтов\n"
-    printf "  ${CYAN}  FastPanel · ISPManager · Hestia  |  Vladislav Pavlovich · @femid00${NC}\n"
+    printf "  ${CYAN}  FastPanel · ISPManager · Hestia  |  Vladislav Pavlovich · @sysadminctl${NC}\n"
     printf "  ${BOLD}${GREEN}%s${NC}\n" "$line"
     printf "\n"
 
@@ -258,8 +262,11 @@ dr() {
 }
 
 generate_password() {
+    # Читаем фиксированный блок через head -c, затем фильтруем — без SIGPIPE
     local len="${1:-20}"
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$len"
+    local raw
+    raw=$(head -c $(( len * 12 )) /dev/urandom | base64 2>/dev/null | tr -dc 'A-Za-z0-9')
+    printf '%s' "${raw:0:$len}"
 }
 
 # Конвертация кириллических доменов в punycode
@@ -396,7 +403,7 @@ check_os_compatibility() {
 
 # Проверяет наличие нужных CLI-команд для обнаруженной панели
 check_panel_compatibility() {
-    log_info "Проверяю совместимость CLI: $CONTROL_PANEL"
+    echo "[$(date '+%H:%M:%S')] [INFO   ] Проверяю совместимость CLI: $CONTROL_PANEL" >> "$LOG_FILE"
     local warnings=0
 
     case $CONTROL_PANEL in
@@ -405,9 +412,10 @@ check_panel_compatibility() {
                 log_error "Команда mogwai не найдена — FastPanel корректно установлен?"
                 return 1
             }
+            # Версию в лог (не на экран)
             local ver
             ver=$(mogwai --version 2>/dev/null | grep -oP '\d+\.\d+[\.\d]*' | head -1 || true)
-            log_info "FastPanel mogwai: ${ver:-версия неизвестна}"
+            echo "[$(date '+%H:%M:%S')] [INFO   ] FastPanel mogwai: ${ver:-версия неизвестна}" >> "$LOG_FILE"
 
             mogwai sites list &>/dev/null || {
                 log_error "'mogwai sites list' недоступен — проверьте права"
@@ -1742,7 +1750,7 @@ main() {
     else
         # ─── Интерактивный режим ─────────────────────────────
         printf "\n  ${DIM}Подсказка: для быстрого запуска используйте:${NC}\n"
-        printf "  ${DIM}  $(basename "$0") source.ru target.ru${NC}\n\n"
+        printf "  ${DIM}  $_SELF source.ru target.ru${NC}\n\n"
 
         local src target
         read -rp "  Исходный сайт (домен): " src

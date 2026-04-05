@@ -147,29 +147,52 @@ show_header() {
     log_info "Лог файл: $LOG_FILE"
 }
 
+# Печатает строку "  Метка:   Значение" с правильным выравниванием для кириллицы.
+# printf %-Ns считает байты, а не символы — поэтому считаем continuation-байты (0x80-0xBF)
+# и компенсируем разницу между байтовой и визуальной шириной.
+_row() {
+    local label="$1" value="$2" target="${3:-18}"
+    local byte_len=${#label}
+    local extra_bytes
+    extra_bytes=$(printf '%s' "$label" | LC_ALL=C grep -oP '[\x80-\xBF]' 2>/dev/null | wc -l || echo 0)
+    local vis_len=$(( byte_len - extra_bytes ))
+    local pad=$(( target - vis_len ))
+    [[ $pad -lt 1 ]] && pad=1
+    printf "  ${BOLD}%s${NC}%*s%s\n" "$label" "$pad" "" "$value"
+}
+
 show_summary() {
     local panel="$1"  source="$2"   target="$3"
     local path="$4"   owner="$5"    db_name="$6"
     local db_user="$7" db_pass="$8" cms="$9"
 
-    printf "\n${GREEN}${BOLD}┌──────────────────────────────────────────────────────────────┐${NC}\n"
-    printf "${GREEN}${BOLD}│${NC}  ✅  %-57s${GREEN}${BOLD}│${NC}\n" "Копирование завершено успешно!"
-    printf "${GREEN}${BOLD}└──────────────────────────────────────────────────────────────┘${NC}\n\n"
+    local line="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    printf "  ${BOLD}%-22s${NC} %s\n"  "Панель:"         "$panel"
-    printf "  ${BOLD}%-22s${NC} %s\n"  "Источник:"       "$source"
-    printf "  ${BOLD}%-22s${NC} %s\n"  "Новый сайт:"     "$target"
-    printf "  ${BOLD}%-22s${NC} %s\n"  "Директория:"     "$path"
-    printf "  ${BOLD}%-22s${NC} %s\n"  "Владелец:"       "$owner"
+    printf "\n"
+    printf "  ${BOLD}${GREEN}%s${NC}\n" "$line"
+    printf "  ${GREEN}✓${NC}  ${BOLD}Копирование завершено успешно!${NC}\n"
+    printf "  ${BOLD}${GREEN}%s${NC}\n\n" "$line"
+
+    _row "Панель:"     "$panel"
+    _row "Источник:"   "$source"
+    _row "Новый сайт:" "$target"
+    _row "Директория:" "$path"
+    _row "Владелец:"   "$owner"
 
     if [[ -n "$cms" && "$cms" != "other" ]]; then
-        printf "  ${BOLD}%-22s${NC} %s\n" "CMS:" "$cms"
-        [[ -n "$db_name" ]]  && printf "  ${BOLD}%-22s${NC} %s\n" "База данных:"     "$db_name"
-        [[ -n "$db_user" ]]  && printf "  ${BOLD}%-22s${NC} %s\n" "Пользователь БД:" "$db_user"
-        [[ -n "$db_pass" ]]  && printf "  ${BOLD}%-22s${NC} %s\n" "Пароль БД:"       "$db_pass"
+        _row "CMS:" "$cms"
+        if [[ -n "$db_name" ]]; then
+            printf "\n"
+            _row "База данных:"     "$db_name"
+            _row "Пользователь БД:" "$db_user"
+            _row "Пароль БД:"       "${YELLOW}${BOLD}${db_pass}${NC}"
+        fi
     fi
 
-    printf "  ${DIM}%-22s %s${NC}\n\n" "Лог:" "$LOG_FILE"
+    printf "\n"
+    printf "  ${DIM}"
+    _row "Лог:" "$LOG_FILE"
+    printf "${NC}\n"
 }
 
 show_next_steps() {
@@ -1706,8 +1729,10 @@ copy_site() {
     if [[ -f /tmp/fp_new_user.info ]]; then
         local fp_user fp_pass
         IFS='|' read -r fp_user fp_pass < /tmp/fp_new_user.info
-        printf "  ${YELLOW}${BOLD}  Новый пользователь FastPanel:${NC} %s\n" "$fp_user"
-        printf "  ${YELLOW}${BOLD}  Пароль пользователя:${NC}          %s\n\n" "$fp_pass"
+        printf "  ${YELLOW}${BOLD}Новый пользователь FastPanel:${NC}\n"
+        _row "  Логин:"  "$fp_user"
+        _row "  Пароль:" "${YELLOW}${BOLD}${fp_pass}${NC}"
+        printf "\n"
         rm -f /tmp/fp_new_user.info
     fi
 

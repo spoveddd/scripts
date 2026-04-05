@@ -1143,8 +1143,8 @@ create_fastpanel_site() {
         fi
     fi
 
-    # Формируем аргументы
-    local create_args="--server-name=$domain --owner=$owner --ip=$ip --handler=$mode"
+    # Формируем аргументы (всегда добавляем www-алиас)
+    local create_args="--server-name=$domain --owner=$owner --ip=$ip --handler=$mode --alias=www.$domain"
     if [[ -n "$ver" && "$ver" != "PHP_VERSION" ]]; then
         create_args="$create_args --handler_version=$ver"
     fi
@@ -1316,6 +1316,9 @@ create_ispmanager_site() {
     if dr $MGRCTL -m ispmgr webdomain.edit sok=ok \
         name="$domain" owner="$owner" ip="$ip" email="$email" >>"$LOG_FILE" 2>&1; then
         log_success "Сайт $domain создан в ISPManager"
+        # Добавляем www-алиас
+        dr $MGRCTL -m ispmgr webdomain.alias.edit sok=ok \
+            domain="$domain" name="www.$domain" >>"$LOG_FILE" 2>&1 || true
 
         if ! $NO_SSL; then
             log_info "Выпускаю Let's Encrypt SSL для $domain..."
@@ -1630,8 +1633,8 @@ copy_site() {
         printf "\n"
 
         if ! $FORCE; then
-            read -rp "  Изменить параметры БД? (y/N): " yn
-            if [[ "${yn,,}" == "y" ]]; then
+            read -rp "  Использовать данные параметры? [Enter — да / n — изменить]: " yn
+            if [[ "${yn,,}" == "n" ]]; then
                 read -rp "  Имя БД [$new_db_name]: " inp; [[ -n "$inp" ]] && new_db_name="$inp"
                 read -rp "  Пользователь [$new_db_user]: " inp; [[ -n "$inp" ]] && new_db_user="$inp"
                 read -rp "  Пароль [$new_db_pass]: " inp; [[ -n "$inp" ]] && new_db_pass="$inp"
@@ -1642,7 +1645,7 @@ copy_site() {
 
         # Проверяем, что БД с таким именем ещё не существует
         if mysql -e "USE \`${new_db_name}\`;" &>/dev/null; then
-            log_error "БД '$new_db_name' уже существует в MySQL — задайте другое имя через 'Изменить параметры БД'"
+            log_error "БД '$new_db_name' уже существует в MySQL — задайте другое имя (запустите снова и нажмите n)"
             do_rollback "site_created" "$new_owner" "$new_site" ""
             return 1
         fi

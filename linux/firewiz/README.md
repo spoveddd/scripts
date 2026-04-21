@@ -39,7 +39,7 @@
 ### Способ 1 — одной командой
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/firewiz/firewiz.sh | sudo bash
+bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/firewiz/firewiz.sh)
 ```
 
 ### Способ 2 — вручную

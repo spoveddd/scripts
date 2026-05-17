@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"serverdoc/internal/diag"
 	"serverdoc/internal/notes"
@@ -14,6 +15,9 @@ import (
 	"serverdoc/internal/stack"
 	"serverdoc/internal/sys"
 )
+
+// Version устанавливается из main через ldflags.
+var Version = "dev"
 
 // Report — полный снимок состояния сервера.
 type Report struct {
@@ -38,8 +42,7 @@ func (r Report) Text(w io.Writer, color bool) {
 	c := palette(color)
 	p := func(format string, a ...interface{}) { fmt.Fprintf(w, format+"\n", a...) }
 
-	p("")
-	p("%sserverdoc — снимок состояния сервера%s", c.bold, c.reset)
+	renderHeader(p, r, c)
 
 	// --- Система ---
 	p("")
@@ -122,6 +125,21 @@ func (r Report) Text(w io.Writer, color bool) {
 		renderLogsDiag(p, r.Diag.Logs, c)
 	}
 
+	// --- Логи сервисов ---
+	if hasServiceLogs(r.Diag) {
+		p("")
+		p("%sЛОГИ СЕРВИСОВ (за 24ч)%s", c.head, c.reset)
+		renderServiceLog(p, "nginx", r.Diag.NginxLog, c)
+		renderServiceLog(p, "MySQL", r.Diag.MySQLLog, c)
+	}
+
+	// --- OOM ---
+	if r.Diag.OOM != nil && (r.Diag.OOM.EventCount > 0 || r.Diag.OOM.Note != "") {
+		p("")
+		p("%sOOM-KILLER (7 дней)%s", c.head, c.reset)
+		renderOOM(p, r.Diag.OOM, c)
+	}
+
 	// --- Замечания ---
 	if len(r.Notes) > 0 {
 		p("")
@@ -135,8 +153,100 @@ func (r Report) Text(w io.Writer, color bool) {
 	p("")
 }
 
+// renderHeader — баннер с версией, хостом, временем и счётчиком замечаний по severity.
+func renderHeader(p func(string, ...interface{}), r Report, c colors) {
+	crit, warn := 0, 0
+	for _, n := range r.Notes {
+		switch n.Severity {
+		case notes.SevCrit:
+			crit++
+		case notes.SevWarn:
+			warn++
+		}
+	}
+
+	const width = 76
+	line := strings.Repeat("═", width)
+
+	title := fmt.Sprintf("serverdoc %s · диагностика Вашего сервера", Version)
+	subtitle := fmt.Sprintf("%s · %s · %s", r.Sys.Hostname, r.Panel,
+		time.Now().Format("2006-01-02 15:04:05 MST"))
+
+	status := c.ok + "проблем не найдено" + c.reset
+	switch {
+	case crit > 0 && warn > 0:
+		status = fmt.Sprintf("%s%d критичных%s · %s%d предупреждений%s",
+			c.bad, crit, c.reset, c.warn, warn, c.reset)
+	case crit > 0:
+		status = fmt.Sprintf("%s%d критичных проблем%s", c.bad, crit, c.reset)
+	case warn > 0:
+		status = fmt.Sprintf("%s%d предупреждений%s", c.warn, warn, c.reset)
+	}
+
+	p("")
+	p("%s╔%s╗%s", c.bold, line, c.reset)
+	p("%s║%s %s%-*s%s%s║%s", c.bold, c.reset, c.bold, width-2, title, c.reset, c.bold, c.reset)
+	p("%s║%s %-*s%s║%s", c.bold, c.reset, width-2, subtitle, c.bold, c.reset)
+	p("%s╚%s╝%s", c.bold, line, c.reset)
+	p("  Статус:  %s", status)
+}
+
 func hasDiag(d diag.Report) bool {
 	return d.Apache != nil || len(d.FPM) > 0 || d.MySQL != nil || d.Procs != nil || d.Logs != nil
+}
+
+func hasServiceLogs(d diag.Report) bool {
+	has := func(l *diag.ServiceLogState) bool {
+		return l != nil && (len(l.Categories) > 0 || l.Note != "")
+	}
+	return has(d.NginxLog) || has(d.MySQLLog)
+}
+
+func renderServiceLog(p func(string, ...interface{}), name string, l *diag.ServiceLogState, c colors) {
+	if l == nil {
+		return
+	}
+	if l.Note != "" {
+		p("  %-7s %s%s%s", name+":", c.warn, l.Note, c.reset)
+		return
+	}
+	if len(l.Categories) == 0 {
+		p("  %-7s чисто (%d сообщений за период)", name+":", l.TotalMatched)
+		return
+	}
+	p("  %-7s %d сообщений (%s):", name+":", l.TotalMatched, l.LogPath)
+	for _, cat := range l.Categories {
+		col := c.head
+		switch cat.Severity {
+		case "crit":
+			col = c.bad
+		case "warn":
+			col = c.warn
+		}
+		p("           %s×%d%s %s", col, cat.Count, c.reset, cat.Description)
+		for _, ex := range cat.Examples {
+			p("             %s", ex)
+		}
+	}
+}
+
+func renderOOM(p func(string, ...interface{}), o *diag.OOMState, c colors) {
+	if o.Note != "" {
+		p("  %s%s%s", c.warn, o.Note, c.reset)
+		return
+	}
+	p("  Источник: %s · событий: %s%d%s", o.Source, c.bad, o.EventCount, c.reset)
+	for _, e := range o.RecentEvents {
+		rss := ""
+		if e.AnonRSSKB > 0 {
+			rss = fmt.Sprintf(" · %d MB RSS", e.AnonRSSKB/1024)
+		}
+		when := e.Time
+		if when == "" {
+			when = "?"
+		}
+		p("    %s · %s%s (pid %d)%s%s", when, c.bad, e.Process, e.PID, c.reset, rss)
+	}
 }
 
 func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c colors) {
@@ -151,9 +261,43 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c col
 	}
 	maxStr := "?"
 	if a.MaxRequestWorkers > 0 {
-		maxStr = fmt.Sprintf("%d (%s%d%%%s)", a.MaxRequestWorkers, col, a.UtilizationPercent, c.reset)
+		maxStr = fmt.Sprintf("%d", a.MaxRequestWorkers)
+		if a.MaxIsDefault {
+			maxStr += " (default)"
+		}
+		maxStr = fmt.Sprintf("%s · %s%d%%%s", maxStr, col, a.UtilizationPercent, c.reset)
 	}
 	p("  Apache:  воркеров живо %d из %s", a.WorkersAlive, maxStr)
+
+	// Estimated memory at full load.
+	if a.ProjectedRAMMB > 0 {
+		p("           средний RSS воркера %d MB · при полной загрузке ~%d MB",
+			a.AvgWorkerRSSMB, a.ProjectedRAMMB)
+	}
+
+	// Конфиг — компактной строкой.
+	cfg := a.Config
+	parts := []string{}
+	if cfg.Timeout > 0 {
+		parts = append(parts, fmt.Sprintf("Timeout=%d", cfg.Timeout))
+	}
+	if cfg.KeepAlive != "" {
+		ka := fmt.Sprintf("KeepAlive=%s", cfg.KeepAlive)
+		if cfg.KeepAliveTimeout > 0 {
+			ka += fmt.Sprintf("/%ds", cfg.KeepAliveTimeout)
+		}
+		parts = append(parts, ka)
+	}
+	if cfg.MaxConnectionsPerChild > 0 {
+		parts = append(parts, fmt.Sprintf("MaxConnPerChild=%d", cfg.MaxConnectionsPerChild))
+	}
+	if cfg.ThreadsPerChild > 0 {
+		parts = append(parts, fmt.Sprintf("ThreadsPerChild=%d", cfg.ThreadsPerChild))
+	}
+	if len(parts) > 0 {
+		p("           конфиг: %s", strings.Join(parts, " · "))
+	}
+
 	if len(a.RecentMPMErrors) > 0 {
 		p("           %sв error.log за 24ч %d MPM-ошибок (упор в MaxRequestWorkers)%s",
 			c.bad, len(a.RecentMPMErrors), c.reset)
@@ -171,20 +315,46 @@ func renderFPMDiag(p func(string, ...interface{}), states []diag.FPMState, c col
 		} else if s.UtilizationPercent >= 80 {
 			col = c.warn
 		}
-		p("  PHP %s: воркеров %d из %d (%s%d%%%s), пулов %d",
-			s.Version, s.WorkersTotal, s.MaxChildrenTotal, col, s.UtilizationPercent, c.reset, len(s.Pools))
-		// Топ-3 пулов с наибольшей утилизацией.
+		ramExtra := ""
+		if s.AvgWorkerRSSMB > 0 {
+			ramExtra = fmt.Sprintf(", avg worker %d MB → ~%d MB при упоре",
+				s.AvgWorkerRSSMB, s.ProjectedRAMMB)
+		}
+		p("  PHP %s: воркеров %d из %d (%s%d%%%s), пулов %d%s",
+			s.Version, s.WorkersTotal, s.MaxChildrenTotal, col, s.UtilizationPercent, c.reset, len(s.Pools), ramExtra)
+		// Топ-3 пулов с наибольшей утилизацией ИЛИ с критичными настройками.
 		shown := 0
 		for _, p2 := range s.Pools {
-			if shown >= 3 || p2.UtilizationPercent < 50 {
-				break
+			interesting := p2.UtilizationPercent >= 50 ||
+				p2.MaxRequests == 0 ||
+				p2.RequestTerminateTimeout == 0
+			if !interesting || shown >= 5 {
+				continue
 			}
-			poolCol := c.warn
+			poolCol := ""
+			if p2.UtilizationPercent >= 80 {
+				poolCol = c.warn
+			}
 			if p2.UtilizationPercent >= 95 {
 				poolCol = c.bad
 			}
-			p("           пул %s: %d/%d (%s%d%%%s)",
-				p2.Name, p2.WorkersAlive, p2.MaxChildren, poolCol, p2.UtilizationPercent, c.reset)
+			extras := []string{}
+			if p2.PM != "" {
+				extras = append(extras, "pm="+p2.PM)
+			}
+			if p2.MaxRequests == 0 {
+				extras = append(extras, c.warn+"max_requests=0"+c.reset)
+			} else {
+				extras = append(extras, fmt.Sprintf("max_req=%d", p2.MaxRequests))
+			}
+			if p2.RequestTerminateTimeout == 0 {
+				extras = append(extras, c.warn+"no_term_timeout"+c.reset)
+			} else {
+				extras = append(extras, fmt.Sprintf("term=%ds", p2.RequestTerminateTimeout))
+			}
+			p("           пул %s: %s%d/%d (%d%%)%s · %s",
+				p2.Name, poolCol, p2.WorkersAlive, p2.MaxChildren, p2.UtilizationPercent, c.reset,
+				strings.Join(extras, " · "))
 			shown++
 		}
 	}

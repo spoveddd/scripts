@@ -49,7 +49,7 @@ func analyzeMySQL(m *stack.Service) *MySQLState {
 	}
 	st.AccessOK = true
 
-	if v, ok := mysqlInt("SELECT @@max_connections"); ok {
+	if v, ok := mysqlVarInt("max_connections"); ok {
 		st.MaxConnections = v
 	}
 	if v, ok := mysqlStatusInt("Threads_connected"); ok {
@@ -89,26 +89,34 @@ func mysqlQuery(sql string) (string, error) {
 	return out, nil
 }
 
-func mysqlInt(sql string) (int, bool) {
-	out, err := mysqlQuery(sql)
-	if err != nil {
-		return 0, false
-	}
-	v, err := strconv.Atoi(strings.TrimSpace(out))
-	return v, err == nil
+func mysqlStatusInt(varname string) (int, bool) {
+	return mysqlShowInt("STATUS", varname)
 }
 
-func mysqlStatusInt(varname string) (int, bool) {
-	out, err := mysqlQuery("SHOW GLOBAL STATUS LIKE '" + varname + "'")
+func mysqlVarInt(varname string) (int, bool) {
+	return mysqlShowInt("VARIABLES", varname)
+}
+
+// mysqlShowInt — общий путь для SHOW GLOBAL {STATUS|VARIABLES} LIKE 'X'.
+// Возвращает целое из последней колонки последней строки.
+func mysqlShowInt(kind, varname string) (int, bool) {
+	out, err := mysqlQuery("SHOW GLOBAL " + kind + " LIKE '" + varname + "'")
 	if err != nil {
 		return 0, false
 	}
-	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) < 2 {
-		return 0, false
+	// Берём именно строку с искомым именем, чтобы не наткнуться на warning-строки.
+	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(ln)
+		if len(fields) < 2 {
+			continue
+		}
+		if !strings.EqualFold(fields[0], varname) {
+			continue
+		}
+		v, err := strconv.Atoi(fields[len(fields)-1])
+		return v, err == nil
 	}
-	v, err := strconv.Atoi(fields[len(fields)-1])
-	return v, err == nil
+	return 0, false
 }
 
 // parseProcesslist разбирает вывод `mysql -BN -e "SHOW FULL PROCESSLIST"`.

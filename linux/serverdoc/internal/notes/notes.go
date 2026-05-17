@@ -5,6 +5,7 @@ package notes
 
 import (
 	"fmt"
+	"strings"
 
 	"serverdoc/internal/diag"
 	"serverdoc/internal/panel"
@@ -35,10 +36,13 @@ func Collect(s sys.Info, sites []panel.Site, st stack.Stack, d diag.Report) []No
 	out = append(out, phpFPMNotes(sites, st.PHP)...)
 	out = append(out, resourceNotes(s)...)
 	out = append(out, siteNotes(sites)...)
-	out = append(out, apacheNotes(d.Apache)...)
-	out = append(out, fpmDiagNotes(d.FPM)...)
+	out = append(out, apacheNotes(d.Apache, st.Apache, s)...)
+	out = append(out, fpmDiagNotes(d.FPM, s)...)
 	out = append(out, mysqlNotes(d.MySQL)...)
 	out = append(out, procsNotes(d.Procs)...)
+	out = append(out, serviceLogNotes("nginx", d.NginxLog)...)
+	out = append(out, serviceLogNotes("MySQL", d.MySQLLog)...)
+	out = append(out, oomNotes(d.OOM)...)
 
 	return out
 }
@@ -83,6 +87,7 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 		}
 	}
 
+	var idle []string
 	for _, p := range php {
 		if !p.MasterRunning {
 			continue
@@ -90,12 +95,15 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 		if p.Pools > 0 || fpmSitesByVer[p.Version] > 0 {
 			continue
 		}
+		idle = append(idle, p.Version)
+	}
+	if len(idle) > 0 {
 		out = append(out, Note{
 			Severity: SevInfo,
-			Code:     "php_fpm_master_idle",
+			Code:     "php_fpm_masters_idle",
 			Text: fmt.Sprintf(
-				"PHP %s: master запущен, но не обслуживает ни одного сайта",
-				p.Version),
+				"PHP %s: masters запущены, но не обслуживают сайты — можно остановить и освободить RAM",
+				strings.Join(idle, ", ")),
 		})
 	}
 
@@ -209,7 +217,7 @@ func siteNotes(sites []panel.Site) []Note {
 	return out
 }
 
-func apacheNotes(a *diag.ApacheState) []Note {
+func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 	if a == nil {
 		return nil
 	}
@@ -246,37 +254,220 @@ func apacheNotes(a *diag.ApacheState) []Note {
 		})
 	}
 
+	if a.MaxIsDefault {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "apache_workers_default",
+			Text: fmt.Sprintf(
+				"Apache: MaxRequestWorkers не задан в конфигах — используется compile-time default (%d). Стоит зафиксировать явно",
+				a.MaxRequestWorkers),
+		})
+	}
+
+	// Память: если все воркеры зайдут, влезут ли они в RAM.
+	if a.ProjectedRAMMB > 0 && s.MemTotalMB > 0 {
+		pct := 100 * a.ProjectedRAMMB / s.MemTotalMB
+		switch {
+		case pct >= 100:
+			out = append(out, Note{
+				Severity: SevCrit,
+				Code:     "apache_memory_oom_risk",
+				Text: fmt.Sprintf(
+					"Apache: при упоре в MaxRequestWorkers (%d × %d MB) понадобится %d MB — больше всей RAM (%d MB). OOM-killer гарантирован",
+					a.MaxRequestWorkers, a.AvgWorkerRSSMB, a.ProjectedRAMMB, s.MemTotalMB),
+			})
+		case pct >= 70:
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "apache_memory_risk",
+				Text: fmt.Sprintf(
+					"Apache: при упоре в MaxRequestWorkers займёт ~%d MB (%d%% RAM, ~%d MB на воркер × %d) — не хватит места для остальных сервисов",
+					a.ProjectedRAMMB, pct, a.AvgWorkerRSSMB, a.MaxRequestWorkers),
+			})
+		}
+	}
+
+	// KeepAlive on + prefork с долгим таймаутом = воркеры висят на idle-keepalive.
+	if stk != nil && stk.MPM == "prefork" && a.Config.KeepAlive == "On" && a.Config.KeepAliveTimeout > 5 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "apache_keepalive_prefork",
+			Text: fmt.Sprintf(
+				"Apache prefork + KeepAlive On + KeepAliveTimeout %d — каждый idle-клиент держит воркер. Снизить до 2-5 или выключить KeepAlive",
+				a.Config.KeepAliveTimeout),
+		})
+	}
+
+	// Большой Timeout при php_fpm/proxy — воркеры лежат пока бэкенд не ответит.
+	if a.Config.Timeout >= 120 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "apache_timeout_high",
+			Text: fmt.Sprintf(
+				"Apache Timeout = %d сек — при зависании бэкенда воркеры будут висеть всё это время. Типичное значение 30-60",
+				a.Config.Timeout),
+		})
+	}
+
+	// MPM event/worker без ThreadsPerChild — берётся compile default (25), но
+	// инженеру стоит увидеть это явно.
+	if stk != nil && (stk.MPM == "event" || stk.MPM == "worker") && a.Config.ThreadsPerChild == 0 {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "apache_mpm_event_no_threads",
+			Text: fmt.Sprintf(
+				"Apache MPM %s: ThreadsPerChild не задан — используется default. Эффективная пропускная способность зависит от ServerLimit × ThreadsPerChild",
+				stk.MPM),
+		})
+	}
+
 	return out
 }
 
-func fpmDiagNotes(states []diag.FPMState) []Note {
+func fpmDiagNotes(states []diag.FPMState, s sys.Info) []Note {
 	var out []Note
-	for _, s := range states {
-		for _, p := range s.Pools {
-			if p.MaxChildren == 0 {
-				continue
+
+	totalProjectedMB := 0
+	for _, st := range states {
+		// Утилизация по пулам.
+		for _, p := range st.Pools {
+			if p.MaxChildren > 0 {
+				switch {
+				case p.UtilizationPercent >= 95:
+					out = append(out, Note{
+						Severity: SevCrit,
+						Code:     "fpm_pool_saturated",
+						Text: fmt.Sprintf(
+							"PHP %s пул %s: %d/%d воркеров (%d%%) — упёрся в pm.max_children, новые запросы ждут",
+							st.Version, p.Name, p.WorkersAlive, p.MaxChildren, p.UtilizationPercent),
+					})
+				case p.UtilizationPercent >= 80:
+					out = append(out, Note{
+						Severity: SevWarn,
+						Code:     "fpm_pool_high",
+						Text: fmt.Sprintf(
+							"PHP %s пул %s: %d/%d воркеров (%d%%) — высокая утилизация",
+							st.Version, p.Name, p.WorkersAlive, p.MaxChildren, p.UtilizationPercent),
+					})
+				}
 			}
-			switch {
-			case p.UtilizationPercent >= 95:
-				out = append(out, Note{
-					Severity: SevCrit,
-					Code:     "fpm_pool_saturated",
-					Text: fmt.Sprintf(
-						"PHP %s пул %s: %d/%d воркеров (%d%%) — упёрся в pm.max_children, новые запросы ждут",
-						s.Version, p.Name, p.WorkersAlive, p.MaxChildren, p.UtilizationPercent),
-				})
-			case p.UtilizationPercent >= 80:
+
+			// pm.max_requests=0 — нет ротации воркеров, утечки накапливаются.
+			if p.MaxRequests == 0 && p.MaxChildren > 0 {
 				out = append(out, Note{
 					Severity: SevWarn,
-					Code:     "fpm_pool_high",
+					Code:     "fpm_no_max_requests",
 					Text: fmt.Sprintf(
-						"PHP %s пул %s: %d/%d воркеров (%d%%) — высокая утилизация",
-						s.Version, p.Name, p.WorkersAlive, p.MaxChildren, p.UtilizationPercent),
+						"PHP %s пул %s: pm.max_requests=0 — воркеры не перезапускаются, утечки памяти накапливаются. Стандартное значение 500-1000",
+						st.Version, p.Name),
 				})
 			}
+
+			// request_terminate_timeout=0 — зависший запрос съест воркера навсегда.
+			if p.RequestTerminateTimeout == 0 && p.MaxChildren > 0 {
+				out = append(out, Note{
+					Severity: SevWarn,
+					Code:     "fpm_no_terminate_timeout",
+					Text: fmt.Sprintf(
+						"PHP %s пул %s: request_terminate_timeout не задан — зависший запрос займёт воркера до перезапуска fpm",
+						st.Version, p.Name),
+				})
+			}
+
+			// pm=static с большим числом воркеров — всегда жрёт память по верхнему лимиту.
+			if p.PM == "static" && p.MaxChildren >= 50 {
+				out = append(out, Note{
+					Severity: SevInfo,
+					Code:     "fpm_pm_static_high",
+					Text: fmt.Sprintf(
+						"PHP %s пул %s: pm=static с %d воркеров — память выделяется по верхнему лимиту независимо от нагрузки",
+						st.Version, p.Name, p.MaxChildren),
+				})
+			}
+
+			// Slowlog не настроен — нет видимости что замедляет сайты.
+			if p.SlowlogPath == "" || p.SlowlogTimeout == 0 {
+				// Не критично, поэтому одна общая info-нота на пул не нужна — пропускаем чтобы не шуметь.
+			}
+		}
+		totalProjectedMB += st.ProjectedRAMMB
+	}
+
+	// Совокупный memory risk: PHP-FPM при упоре в max_children.
+	if totalProjectedMB > 0 && s.MemTotalMB > 0 {
+		pct := 100 * totalProjectedMB / s.MemTotalMB
+		switch {
+		case pct >= 100:
+			out = append(out, Note{
+				Severity: SevCrit,
+				Code:     "fpm_memory_oom_risk",
+				Text: fmt.Sprintf(
+					"PHP-FPM: при упоре всех пулов в pm.max_children понадобится ~%d MB — больше всей RAM (%d MB). OOM-killer гарантирован",
+					totalProjectedMB, s.MemTotalMB),
+			})
+		case pct >= 70:
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "fpm_memory_risk",
+				Text: fmt.Sprintf(
+					"PHP-FPM: при упоре всех пулов займёт ~%d MB (%d%% RAM) — не хватит места для остальных сервисов",
+					totalProjectedMB, pct),
+			})
 		}
 	}
+
 	return out
+}
+
+func serviceLogNotes(name string, l *diag.ServiceLogState) []Note {
+	if l == nil || len(l.Categories) == 0 {
+		return nil
+	}
+	var out []Note
+	for _, cat := range l.Categories {
+		sev := SevInfo
+		switch cat.Severity {
+		case "crit":
+			sev = SevCrit
+		case "warn":
+			sev = SevWarn
+		}
+		out = append(out, Note{
+			Severity: sev,
+			Code:     cat.Code,
+			Text: fmt.Sprintf(
+				"%s error.log за %dч: %s (×%d)",
+				name, l.PeriodHours, cat.Description, cat.Count),
+		})
+	}
+	return out
+}
+
+func oomNotes(o *diag.OOMState) []Note {
+	if o == nil || o.EventCount == 0 {
+		return nil
+	}
+	// Сводим: какие процессы убивались чаще всего.
+	byProc := map[string]int{}
+	for _, e := range o.RecentEvents {
+		byProc[e.Process]++
+	}
+	var procList []string
+	for p, n := range byProc {
+		if n > 1 {
+			procList = append(procList, fmt.Sprintf("%s×%d", p, n))
+		} else {
+			procList = append(procList, p)
+		}
+	}
+	procs := strings.Join(procList, ", ")
+	return []Note{{
+		Severity: SevCrit,
+		Code:     "oom_recent",
+		Text: fmt.Sprintf(
+			"OOM-killer убил %d процессов за 7 дней (%s) — сервер периодически уходит в дефицит RAM",
+			o.EventCount, procs),
+	}}
 }
 
 func mysqlNotes(m *diag.MySQLState) []Note {

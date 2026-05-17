@@ -29,6 +29,7 @@ func main() {
 		return
 	}
 
+	report.Version = version
 	info := sys.Collect()
 	pk := panel.Detect()
 	sites, warn, err := panel.ListSites(pk)

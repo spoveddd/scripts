@@ -19,14 +19,24 @@ type FPMState struct {
 	WorkersTotal       int       `json:"workers_total"`
 	MaxChildrenTotal   int       `json:"max_children_total"`
 	UtilizationPercent int       `json:"utilization_percent"`
+	AvgWorkerRSSMB     int       `json:"avg_worker_rss_mb,omitempty"`
+	ProjectedRAMMB     int       `json:"projected_ram_mb,omitempty"` // Σ max_children × avgRSS
 }
 
-// FPMPool — один пул php-fpm.
+// FPMPool — один пул php-fpm со всем что важно для аудита.
 type FPMPool struct {
-	Name               string `json:"name"`
-	MaxChildren        int    `json:"max_children"`
-	WorkersAlive       int    `json:"workers_alive"`
-	UtilizationPercent int    `json:"utilization_percent"`
+	Name                    string `json:"name"`
+	PM                      string `json:"pm,omitempty"` // dynamic/static/ondemand
+	MaxChildren             int    `json:"max_children"`
+	StartServers            int    `json:"start_servers,omitempty"`
+	MinSpareServers         int    `json:"min_spare_servers,omitempty"`
+	MaxSpareServers         int    `json:"max_spare_servers,omitempty"`
+	MaxRequests             int    `json:"max_requests"` // 0 = нет ротации (memleak risk)
+	RequestTerminateTimeout int    `json:"request_terminate_timeout_sec"`
+	SlowlogPath             string `json:"slowlog_path,omitempty"`
+	SlowlogTimeout          int    `json:"slowlog_timeout_sec,omitempty"`
+	WorkersAlive            int    `json:"workers_alive"`
+	UtilizationPercent      int    `json:"utilization_percent"`
 }
 
 func analyzeFPM(php []stack.PHPVersion) []FPMState {
@@ -34,26 +44,23 @@ func analyzeFPM(php []stack.PHPVersion) []FPMState {
 		return nil
 	}
 
-	// Один раз пробегаем /proc: собираем мастера (cmdline → версия) и
-	// воркеры (cmdline → имя пула, PPID → master PID → версия).
 	masters, workers := scanFPMProcesses()
 
-	// Сгруппируем воркеры по (version, pool_name).
+	// PIDs всех воркеров с привязкой к (version, pool).
 	type vp struct{ ver, pool string }
-	workersByVP := map[vp]int{}
+	workersByVP := map[vp][]int{}
 	for _, w := range workers {
 		master, ok := masters[w.ppid]
 		if !ok {
 			continue
 		}
-		workersByVP[vp{master, w.pool}]++
+		k := vp{master, w.pool}
+		workersByVP[k] = append(workersByVP[k], w.pid)
 	}
 
 	var out []FPMState
 	for _, p := range php {
 		if p.PoolDir == "" {
-			// Без каталога пулов мы не знаем pm.max_children — пропускаем
-			// (мастер мог быть запущен, но конфиги в нестандартном месте).
 			continue
 		}
 		pools := parseFPMPools(p.PoolDir)
@@ -61,18 +68,32 @@ func analyzeFPM(php []stack.PHPVersion) []FPMState {
 			continue
 		}
 		st := FPMState{Version: p.Version}
+		var rssSum, rssCount int
 		for i := range pools {
-			pools[i].WorkersAlive = workersByVP[vp{p.Version, pools[i].Name}]
+			pids := workersByVP[vp{p.Version, pools[i].Name}]
+			pools[i].WorkersAlive = len(pids)
+			for _, pid := range pids {
+				mb := procRSSMB(pid)
+				if mb > 0 {
+					rssSum += mb
+					rssCount++
+				}
+			}
 			if pools[i].MaxChildren > 0 {
 				pools[i].UtilizationPercent = 100 * pools[i].WorkersAlive / pools[i].MaxChildren
 			}
 			st.MaxChildrenTotal += pools[i].MaxChildren
 			st.WorkersTotal += pools[i].WorkersAlive
 		}
+		if rssCount > 0 {
+			st.AvgWorkerRSSMB = rssSum / rssCount
+		}
+		if st.AvgWorkerRSSMB > 0 && st.MaxChildrenTotal > 0 {
+			st.ProjectedRAMMB = st.AvgWorkerRSSMB * st.MaxChildrenTotal
+		}
 		if st.MaxChildrenTotal > 0 {
 			st.UtilizationPercent = 100 * st.WorkersTotal / st.MaxChildrenTotal
 		}
-		// Сортируем пулы по убыванию утилизации — самые горячие наверху.
 		sort.SliceStable(pools, func(i, j int) bool {
 			return pools[i].UtilizationPercent > pools[j].UtilizationPercent
 		})
@@ -92,12 +113,10 @@ type fpmWorker struct {
 var (
 	fpmMasterCmdRe = regexp.MustCompile(`php-fpm:\s*master\s+process\s+\(([^)]+)\)`)
 	fpmPoolCmdRe   = regexp.MustCompile(`php-fpm:\s*pool\s+(\S+)`)
-	// Версия из пути конфига мастера: см. stack.versionFromConfigPath.
-	verEtcRe = regexp.MustCompile(`/etc/php/(\d+\.\d+)/`)
-	verOptRe = regexp.MustCompile(`/(?:opt|etc/opt/remi)/php(\d)(\d+)/`)
+	verEtcRe       = regexp.MustCompile(`/etc/php/(\d+\.\d+)/`)
+	verOptRe       = regexp.MustCompile(`/(?:opt|etc/opt/remi)/php(\d)(\d+)/`)
 )
 
-// scanFPMProcesses возвращает карту PID мастера → версия PHP, и список воркеров.
 func scanFPMProcesses() (map[int]string, []fpmWorker) {
 	masters := map[int]string{}
 	var workers []fpmWorker
@@ -144,8 +163,6 @@ func versionFromPath(p string) string {
 	return ""
 }
 
-// parseFPMPools читает все *.conf в poolDir (нерекурсивно) и возвращает
-// список пулов с pm.max_children. Фильтрует служебные имена.
 func parseFPMPools(poolDir string) []FPMPool {
 	ents, err := os.ReadDir(poolDir)
 	if err != nil {
@@ -174,7 +191,8 @@ func parseFPMPools(poolDir string) []FPMPool {
 
 var (
 	poolSectionRe = regexp.MustCompile(`^\[([^\]]+)\]`)
-	poolMaxChRe   = regexp.MustCompile(`^\s*pm\.max_children\s*=\s*(\d+)`)
+	// Все интересные директивы. Значение — после = с возможными пробелами.
+	poolDirectiveRe = regexp.MustCompile(`^\s*(pm|pm\.max_children|pm\.start_servers|pm\.min_spare_servers|pm\.max_spare_servers|pm\.max_requests|request_terminate_timeout|slowlog|request_slowlog_timeout)\s*=\s*(.+?)\s*$`)
 )
 
 func readPoolConf(path string) FPMPool {
@@ -188,13 +206,76 @@ func readPoolConf(path string) FPMPool {
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		ln := sc.Text()
+		// Пропускаем комментарии.
+		trim := strings.TrimSpace(ln)
+		if strings.HasPrefix(trim, ";") || strings.HasPrefix(trim, "#") {
+			continue
+		}
 		if m := poolSectionRe.FindStringSubmatch(ln); m != nil && p.Name == "" {
 			p.Name = m[1]
+			continue
 		}
-		if m := poolMaxChRe.FindStringSubmatch(ln); m != nil {
-			v, _ := strconv.Atoi(m[1])
-			p.MaxChildren = v
+		m := poolDirectiveRe.FindStringSubmatch(ln)
+		if m == nil {
+			continue
+		}
+		val := m[2]
+		switch m[1] {
+		case "pm":
+			p.PM = val
+		case "pm.max_children":
+			p.MaxChildren = atoiOr(val, 0)
+		case "pm.start_servers":
+			p.StartServers = atoiOr(val, 0)
+		case "pm.min_spare_servers":
+			p.MinSpareServers = atoiOr(val, 0)
+		case "pm.max_spare_servers":
+			p.MaxSpareServers = atoiOr(val, 0)
+		case "pm.max_requests":
+			p.MaxRequests = atoiOr(val, 0)
+		case "request_terminate_timeout":
+			p.RequestTerminateTimeout = parseDurationSec(val)
+		case "slowlog":
+			p.SlowlogPath = val
+		case "request_slowlog_timeout":
+			p.SlowlogTimeout = parseDurationSec(val)
 		}
 	}
 	return p
+}
+
+// atoiOr — int с дефолтом при ошибке.
+func atoiOr(s string, def int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// parseDurationSec — поддерживает "30s", "5m", "1h" и просто число (секунды).
+// PHP-FPM формат коротких единиц.
+func parseDurationSec(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0
+	}
+	suf := s[len(s)-1]
+	num := s
+	mult := 1
+	switch suf {
+	case 's':
+		num = s[:len(s)-1]
+	case 'm':
+		num, mult = s[:len(s)-1], 60
+	case 'h':
+		num, mult = s[:len(s)-1], 3600
+	case 'd':
+		num, mult = s[:len(s)-1], 86400
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(num))
+	if err != nil {
+		return 0
+	}
+	return v * mult
 }

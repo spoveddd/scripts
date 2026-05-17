@@ -8,19 +8,21 @@ import (
 	"sort"
 	"strings"
 
+	"serverdoc/internal/diag"
 	"serverdoc/internal/notes"
 	"serverdoc/internal/panel"
 	"serverdoc/internal/stack"
 	"serverdoc/internal/sys"
 )
 
-// Report — полный снимок состояния сервера (Фаза 1).
+// Report — полный снимок состояния сервера.
 type Report struct {
 	Sys      sys.Info     `json:"system"`
 	Panel    string       `json:"panel"`
 	Sites    []panel.Site `json:"sites"`
 	SiteWarn string       `json:"sites_warning,omitempty"`
 	Stack    stack.Stack  `json:"stack"`
+	Diag     diag.Report  `json:"diag"`
 	Notes    []notes.Note `json:"notes,omitempty"`
 }
 
@@ -109,13 +111,22 @@ func (r Report) Text(w io.Writer, color bool) {
 	}
 	renderPHP(p, r.Stack.PHP, byPHP, c)
 
+	// --- Динамика ---
+	if hasDiag(r.Diag) {
+		p("")
+		p("%sДИНАМИКА%s", c.head, c.reset)
+		renderApacheDiag(p, r.Diag.Apache, c)
+		renderFPMDiag(p, r.Diag.FPM, c)
+		renderMySQLDiag(p, r.Diag.MySQL, c)
+		renderProcsDiag(p, r.Diag.Procs, c)
+		renderLogsDiag(p, r.Diag.Logs, c)
+	}
+
 	// --- Замечания ---
 	if len(r.Notes) > 0 {
 		p("")
 		p("%sЗАМЕЧАНИЯ%s", c.head, c.reset)
-		// Сортируем по убыванию severity.
-		ordered := orderNotes(r.Notes)
-		for _, n := range ordered {
+		for _, n := range orderNotes(r.Notes) {
 			marker, col := severityMarker(n.Severity, c)
 			p("  %s %s%s%s", marker, col, n.Text, c.reset)
 		}
@@ -124,35 +135,147 @@ func (r Report) Text(w io.Writer, color bool) {
 	p("")
 }
 
-// renderPHP печатает PHP-версии, сворачивая "пустые" (master запущен,
-// 0 пулов, 0 сайтов на этой версии) в одну строку — иначе на серверах
-// с 10+ установленными версиями (Hestia) отчёт переполняется шумом.
-func renderPHP(p func(string, ...interface{}), php []stack.PHPVersion, byPHP map[string]int, c colors) {
-	if len(php) == 0 {
-		p("  PHP-FPM: не обнаружен")
+func hasDiag(d diag.Report) bool {
+	return d.Apache != nil || len(d.FPM) > 0 || d.MySQL != nil || d.Procs != nil || d.Logs != nil
+}
+
+func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c colors) {
+	if a == nil {
 		return
 	}
-
-	var empty []string
-	for _, v := range php {
-		// "Пустая": сайтов на этой версии нет, пулов нет, master крутится без работы.
-		if v.MasterRunning && v.Pools == 0 && byPHP[v.Version] == 0 {
-			empty = append(empty, v.Version)
-			continue
-		}
-		state := c.warn + "master не запущен" + c.reset
-		if v.MasterRunning {
-			state = c.ok + "master запущен" + c.reset
-		}
-		src := ""
-		if v.Service != "" {
-			src = " · " + v.Service
-		}
-		p("  PHP %s: %d пулов · %s%s", v.Version, v.Pools, state, src)
+	col := c.ok
+	if a.UtilizationPercent >= 95 {
+		col = c.bad
+	} else if a.UtilizationPercent >= 80 {
+		col = c.warn
 	}
-	if len(empty) > 0 {
-		p("  PHP %s: установлены, без пулов и сайтов · %smaster запущен%s",
-			strings.Join(empty, ", "), c.ok, c.reset)
+	maxStr := "?"
+	if a.MaxRequestWorkers > 0 {
+		maxStr = fmt.Sprintf("%d (%s%d%%%s)", a.MaxRequestWorkers, col, a.UtilizationPercent, c.reset)
+	}
+	p("  Apache:  воркеров живо %d из %s", a.WorkersAlive, maxStr)
+	if len(a.RecentMPMErrors) > 0 {
+		p("           %sв error.log за 24ч %d MPM-ошибок (упор в MaxRequestWorkers)%s",
+			c.bad, len(a.RecentMPMErrors), c.reset)
+	}
+}
+
+func renderFPMDiag(p func(string, ...interface{}), states []diag.FPMState, c colors) {
+	if len(states) == 0 {
+		return
+	}
+	for _, s := range states {
+		col := c.ok
+		if s.UtilizationPercent >= 95 {
+			col = c.bad
+		} else if s.UtilizationPercent >= 80 {
+			col = c.warn
+		}
+		p("  PHP %s: воркеров %d из %d (%s%d%%%s), пулов %d",
+			s.Version, s.WorkersTotal, s.MaxChildrenTotal, col, s.UtilizationPercent, c.reset, len(s.Pools))
+		// Топ-3 пулов с наибольшей утилизацией.
+		shown := 0
+		for _, p2 := range s.Pools {
+			if shown >= 3 || p2.UtilizationPercent < 50 {
+				break
+			}
+			poolCol := c.warn
+			if p2.UtilizationPercent >= 95 {
+				poolCol = c.bad
+			}
+			p("           пул %s: %d/%d (%s%d%%%s)",
+				p2.Name, p2.WorkersAlive, p2.MaxChildren, poolCol, p2.UtilizationPercent, c.reset)
+			shown++
+		}
+	}
+}
+
+func renderMySQLDiag(p func(string, ...interface{}), m *diag.MySQLState, c colors) {
+	if m == nil {
+		return
+	}
+	if !m.AccessOK {
+		p("  MySQL:   %sнет доступа: %s%s", c.warn, m.AccessError, c.reset)
+		return
+	}
+	col := c.ok
+	if m.UtilizationPercent >= 90 {
+		col = c.bad
+	} else if m.UtilizationPercent >= 70 {
+		col = c.warn
+	}
+	p("  MySQL:   %d/%d соединений (%s%d%%%s), активных запросов %d",
+		m.ThreadsConnected, m.MaxConnections, col, m.UtilizationPercent, c.reset, m.ThreadsRunning)
+	if m.LongRunningCount > 0 {
+		p("           %sдолгих запросов (>30с): %d%s", c.warn, m.LongRunningCount, c.reset)
+		for i, q := range m.LongRunning {
+			if i >= 3 {
+				break
+			}
+			info := q.InfoHead
+			if info == "" {
+				info = "(нет SQL)"
+			}
+			p("             #%d %ds %s@%s: %s", q.ID, q.TimeSec, q.User, q.DB, info)
+		}
+	}
+}
+
+func renderProcsDiag(p func(string, ...interface{}), pr *diag.ProcsState, c colors) {
+	if pr == nil {
+		return
+	}
+	line := fmt.Sprintf("процессов %d", pr.Total)
+	if pr.DState > 0 {
+		col := c.warn
+		if pr.DState >= 5 {
+			col = c.bad
+		}
+		line += fmt.Sprintf(" · %sD-state %d%s", col, pr.DState, c.reset)
+	}
+	if pr.Zombie > 0 {
+		col := c.warn
+		if pr.Zombie >= 10 {
+			col = c.bad
+		}
+		line += fmt.Sprintf(" · %szombie %d%s", col, pr.Zombie, c.reset)
+	}
+	p("  Процессы: %s", line)
+	if len(pr.DStateProcs) > 0 {
+		for _, d := range pr.DStateProcs {
+			p("           %sD-state PID %d (%s): %s%s", c.bad, d.PID, d.Name, d.Cmdline, c.reset)
+		}
+	}
+	if len(pr.TopByRSS) > 0 {
+		parts := make([]string, 0, len(pr.TopByRSS))
+		for _, t := range pr.TopByRSS {
+			parts = append(parts, fmt.Sprintf("%s=%dMB", t.Name, t.RSSMB))
+		}
+		p("           top RAM: %s", strings.Join(parts, ", "))
+	}
+}
+
+func renderLogsDiag(p func(string, ...interface{}), l *diag.LogsState, c colors) {
+	if l == nil {
+		return
+	}
+	if l.Note != "" {
+		p("  Логи:    %s%s%s", c.warn, l.Note, c.reset)
+		return
+	}
+	p("  Логи (%dм, файлов %d): всего запросов %d", l.PeriodMinutes, l.ParsedFiles, l.TotalRequests)
+	for i, s := range l.TopSites {
+		if i >= 5 {
+			break
+		}
+		col := ""
+		if s.RequestsPerSec >= 10 {
+			col = c.warn
+		}
+		if s.RequestsPerSec >= 50 {
+			col = c.bad
+		}
+		p("           %s%-35s %6d req · %.1f rps%s", col, truncate(s.Site, 35), s.Requests, s.RequestsPerSec, c.reset)
 	}
 }
 
@@ -174,6 +297,36 @@ func severityMarker(s notes.Severity, c colors) (string, string) {
 		return c.warn + "!" + c.reset, c.warn
 	default:
 		return c.head + "·" + c.reset, ""
+	}
+}
+
+// renderPHP печатает PHP-версии, сворачивая "пустые" (master запущен,
+// 0 пулов, 0 сайтов на этой версии) в одну строку.
+func renderPHP(p func(string, ...interface{}), php []stack.PHPVersion, byPHP map[string]int, c colors) {
+	if len(php) == 0 {
+		p("  PHP-FPM: не обнаружен")
+		return
+	}
+
+	var empty []string
+	for _, v := range php {
+		if v.MasterRunning && v.Pools == 0 && byPHP[v.Version] == 0 {
+			empty = append(empty, v.Version)
+			continue
+		}
+		state := c.warn + "master не запущен" + c.reset
+		if v.MasterRunning {
+			state = c.ok + "master запущен" + c.reset
+		}
+		src := ""
+		if v.Service != "" {
+			src = " · " + v.Service
+		}
+		p("  PHP %s: %d пулов · %s%s", v.Version, v.Pools, state, src)
+	}
+	if len(empty) > 0 {
+		p("  PHP %s: установлены, без пулов и сайтов · %smaster запущен%s",
+			strings.Join(empty, ", "), c.ok, c.reset)
 	}
 }
 
@@ -211,7 +364,13 @@ func dash(s string) string {
 	return s
 }
 
-// handlerLabel — короткий человеческий ярлык для константы из panel.Handler*.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
 func handlerLabel(h string) string {
 	switch h {
 	case panel.HandlerPHPFPM:

@@ -1,7 +1,5 @@
 // Команда serverdoc — диагностический инструмент для серверов хостинга
 // с панелями управления (ISPmanager, FastPanel, HestiaCP).
-//
-// Фаза 1: определение панели и инвентаризация стека.
 package main
 
 import (
@@ -9,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"serverdoc/internal/diag"
 	"serverdoc/internal/notes"
 	"serverdoc/internal/panel"
 	"serverdoc/internal/report"
@@ -37,6 +36,7 @@ func main() {
 		warn = "не удалось получить список сайтов: " + err.Error()
 	}
 	st := stack.Collect()
+	d := diag.Collect(st, pk, sites)
 
 	rep := report.Report{
 		Sys:      info,
@@ -44,7 +44,8 @@ func main() {
 		Sites:    sites,
 		SiteWarn: warn,
 		Stack:    st,
-		Notes:    notes.Collect(info, sites, st),
+		Diag:     d,
+		Notes:    notes.Collect(info, sites, st, d),
 	}
 
 	if *asJSON {
@@ -54,8 +55,7 @@ func main() {
 	rep.Text(os.Stdout, !*noColor && isTerminal(os.Stdout))
 }
 
-// isTerminal сообщает, является ли вывод терминалом (для цветов) —
-// без внешних зависимостей, через тип устройства файла.
+// isTerminal сообщает, является ли вывод терминалом (для цветов).
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
 	if err != nil {

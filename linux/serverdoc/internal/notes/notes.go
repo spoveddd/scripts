@@ -6,6 +6,7 @@ package notes
 import (
 	"fmt"
 
+	"serverdoc/internal/diag"
 	"serverdoc/internal/panel"
 	"serverdoc/internal/stack"
 	"serverdoc/internal/sys"
@@ -28,12 +29,16 @@ type Note struct {
 }
 
 // Collect строит список замечаний по снапшоту.
-func Collect(s sys.Info, sites []panel.Site, st stack.Stack) []Note {
+func Collect(s sys.Info, sites []panel.Site, st stack.Stack, d diag.Report) []Note {
 	var out []Note
 
 	out = append(out, phpFPMNotes(sites, st.PHP)...)
 	out = append(out, resourceNotes(s)...)
 	out = append(out, siteNotes(sites)...)
+	out = append(out, apacheNotes(d.Apache)...)
+	out = append(out, fpmDiagNotes(d.FPM)...)
+	out = append(out, mysqlNotes(d.MySQL)...)
+	out = append(out, procsNotes(d.Procs)...)
 
 	return out
 }
@@ -42,7 +47,6 @@ func Collect(s sys.Info, sites []panel.Site, st stack.Stack) []Note {
 func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 	var out []Note
 
-	// Сколько активных сайтов использует каждую PHP-версию через php_fpm.
 	fpmSitesByVer := map[string]int{}
 	for _, s := range sites {
 		if !s.Enabled || s.Handler != panel.HandlerPHPFPM || s.PHPVersion == "" {
@@ -51,13 +55,11 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 		fpmSitesByVer[s.PHPVersion]++
 	}
 
-	// Карта Stack.PHP → версия.
 	stackByVer := map[string]stack.PHPVersion{}
 	for _, p := range php {
 		stackByVer[p.Version] = p
 	}
 
-	// CRIT: сайты на php_fpm есть, master не запущен → 502.
 	for ver, n := range fpmSitesByVer {
 		p, ok := stackByVer[ver]
 		if !ok {
@@ -81,7 +83,6 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 		}
 	}
 
-	// INFO: master запущен, но никем не используется (пулов нет и сайтов нет).
 	for _, p := range php {
 		if !p.MasterRunning {
 			continue
@@ -98,7 +99,6 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 		})
 	}
 
-	// WARN: пулы есть, master не запущен (конфиги остались от выключенной версии).
 	for _, p := range php {
 		if p.MasterRunning || p.Pools == 0 {
 			continue
@@ -115,7 +115,6 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 	return out
 }
 
-// resourceNotes — давление по памяти/swap/LA.
 func resourceNotes(s sys.Info) []Note {
 	var out []Note
 
@@ -185,7 +184,6 @@ func resourceNotes(s sys.Info) []Note {
 	return out
 }
 
-// siteNotes — простые наблюдения по составу сайтов.
 func siteNotes(sites []panel.Site) []Note {
 	var out []Note
 
@@ -211,7 +209,173 @@ func siteNotes(sites []panel.Site) []Note {
 	return out
 }
 
-// parseLoad — превращает "1.19" в 1.19, "-" в 0.
+func apacheNotes(a *diag.ApacheState) []Note {
+	if a == nil {
+		return nil
+	}
+	var out []Note
+
+	if a.MaxRequestWorkers > 0 {
+		switch {
+		case a.UtilizationPercent >= 95:
+			out = append(out, Note{
+				Severity: SevCrit,
+				Code:     "apache_workers_saturated",
+				Text: fmt.Sprintf(
+					"Apache: %d/%d воркеров занято (%d%%) — на грани MaxRequestWorkers, новые запросы будут вставать в очередь",
+					a.WorkersAlive, a.MaxRequestWorkers, a.UtilizationPercent),
+			})
+		case a.UtilizationPercent >= 80:
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "apache_workers_high",
+				Text: fmt.Sprintf(
+					"Apache: %d/%d воркеров занято (%d%%) — приближается к лимиту MaxRequestWorkers",
+					a.WorkersAlive, a.MaxRequestWorkers, a.UtilizationPercent),
+			})
+		}
+	}
+
+	if len(a.RecentMPMErrors) > 0 {
+		out = append(out, Note{
+			Severity: SevCrit,
+			Code:     "apache_mpm_errors",
+			Text: fmt.Sprintf(
+				"Apache: в error.log за последние 24ч %d критических MPM-сообщений (сервер упирался в лимит воркеров)",
+				len(a.RecentMPMErrors)),
+		})
+	}
+
+	return out
+}
+
+func fpmDiagNotes(states []diag.FPMState) []Note {
+	var out []Note
+	for _, s := range states {
+		for _, p := range s.Pools {
+			if p.MaxChildren == 0 {
+				continue
+			}
+			switch {
+			case p.UtilizationPercent >= 95:
+				out = append(out, Note{
+					Severity: SevCrit,
+					Code:     "fpm_pool_saturated",
+					Text: fmt.Sprintf(
+						"PHP %s пул %s: %d/%d воркеров (%d%%) — упёрся в pm.max_children, новые запросы ждут",
+						s.Version, p.Name, p.WorkersAlive, p.MaxChildren, p.UtilizationPercent),
+				})
+			case p.UtilizationPercent >= 80:
+				out = append(out, Note{
+					Severity: SevWarn,
+					Code:     "fpm_pool_high",
+					Text: fmt.Sprintf(
+						"PHP %s пул %s: %d/%d воркеров (%d%%) — высокая утилизация",
+						s.Version, p.Name, p.WorkersAlive, p.MaxChildren, p.UtilizationPercent),
+				})
+			}
+		}
+	}
+	return out
+}
+
+func mysqlNotes(m *diag.MySQLState) []Note {
+	if m == nil {
+		return nil
+	}
+	var out []Note
+
+	if !m.AccessOK {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "mysql_no_access",
+			Text: "MySQL: serverdoc не смог подключиться (нет socket-auth для root или .my.cnf) — диагностика БД пропущена",
+		})
+		return out
+	}
+
+	if m.MaxConnections > 0 {
+		switch {
+		case m.UtilizationPercent >= 90:
+			out = append(out, Note{
+				Severity: SevCrit,
+				Code:     "mysql_connections_saturated",
+				Text: fmt.Sprintf(
+					"MySQL: %d/%d соединений (%d%%) — близко к max_connections, новые сайты будут ловить 'Too many connections'",
+					m.ThreadsConnected, m.MaxConnections, m.UtilizationPercent),
+			})
+		case m.UtilizationPercent >= 70:
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "mysql_connections_high",
+				Text: fmt.Sprintf(
+					"MySQL: %d/%d соединений (%d%%) — приближается к max_connections",
+					m.ThreadsConnected, m.MaxConnections, m.UtilizationPercent),
+			})
+		}
+	}
+
+	if m.LongRunningCount > 0 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "mysql_long_queries",
+			Text: fmt.Sprintf(
+				"MySQL: %d запросов выполняются дольше 30 секунд — возможный runaway или блокировка",
+				m.LongRunningCount),
+		})
+	}
+
+	// Подозрительные state'ы: "Locked" / "Waiting for table metadata lock" / "Sending data" > 5.
+	if n := m.QueriesByState["Locked"] + m.QueriesByState["Waiting for table metadata lock"]; n > 0 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "mysql_lock_contention",
+			Text: fmt.Sprintf(
+				"MySQL: %d запросов в состоянии блокировки — возможна lock contention",
+				n),
+		})
+	}
+
+	return out
+}
+
+func procsNotes(p *diag.ProcsState) []Note {
+	if p == nil {
+		return nil
+	}
+	var out []Note
+
+	if p.DState >= 5 {
+		out = append(out, Note{
+			Severity: SevCrit,
+			Code:     "dstate_storm",
+			Text: fmt.Sprintf(
+				"%d процессов в состоянии D (ждут I/O) — почти всегда дисковая подсистема в перегрузке",
+				p.DState),
+		})
+	} else if p.DState >= 2 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "dstate_some",
+			Text: fmt.Sprintf(
+				"%d процессов в состоянии D — стоит проверить дисковую активность (iostat/iotop)",
+				p.DState),
+		})
+	}
+
+	if p.Zombie >= 10 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "zombies_many",
+			Text: fmt.Sprintf(
+				"%d zombie-процессов — родитель не вызывает wait(), возможна утечка PID",
+				p.Zombie),
+		})
+	}
+
+	return out
+}
+
 func parseLoad(s string) float64 {
 	var f float64
 	_, err := fmt.Sscanf(s, "%f", &f)

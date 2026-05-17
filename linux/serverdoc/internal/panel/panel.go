@@ -252,10 +252,15 @@ func normalizeISPMode(m string) string {
 	}
 }
 
-// stripISPVersion отсекает суффикс " (alt)" — у ISP формат "7.4.33 (alt)".
+// stripISPVersion отсекает суффикс " (alt)" и патч-часть — у ISP формат
+// "7.4.33 (alt)", приводим к общему "X.Y" как у FastPanel/Hestia.
 func stripISPVersion(v string) string {
 	if i := strings.Index(v, " "); i >= 0 {
-		return v[:i]
+		v = v[:i]
+	}
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
 	}
 	return v
 }

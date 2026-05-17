@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"serverdoc/internal/notes"
 	"serverdoc/internal/panel"
 	"serverdoc/internal/report"
 	"serverdoc/internal/stack"
@@ -43,6 +44,7 @@ func main() {
 		Sites:    sites,
 		SiteWarn: warn,
 		Stack:    st,
+		Notes:    notes.Collect(info, sites, st),
 	}
 
 	if *asJSON {

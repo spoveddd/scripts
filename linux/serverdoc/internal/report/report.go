@@ -166,9 +166,19 @@ func (r Report) Text(w io.Writer, color bool) {
 	if len(r.Notes) > 0 {
 		p("")
 		p("%sЗАМЕЧАНИЯ%s", c.head, c.reset)
+		// Wrap длинных текстов по ширине отчёта. Первая строка: "  X TEXT",
+		// продолжение: "    TEXT" (отступ как у текста).
+		const wrapWidth = reportWidth - 4 // - "  X " (4 руны)
 		for _, n := range orderNotes(r.Notes) {
 			marker, col := severityMarker(n.Severity, c)
-			p("  %s %s%s%s", marker, col, n.Text, c.reset)
+			lines := wrapText(n.Text, wrapWidth)
+			for i, ln := range lines {
+				if i == 0 {
+					p("  %s %s%s%s", marker, col, ln, c.reset)
+				} else {
+					p("    %s%s%s", col, ln, c.reset)
+				}
+			}
 		}
 	}
 
@@ -190,8 +200,10 @@ func renderHeader(p func(string, ...interface{}), r Report, c colors) {
 		}
 	}
 
-	const width = 76
-	line := strings.Repeat("═", width)
+	// reportWidth — общая визуальная ширина рамки (включая ║ слева и справа).
+	// Внутри: ║ + " " + content + " " + ║ → contentWidth = reportWidth-4.
+	const contentWidth = reportWidth - 4
+	line := strings.Repeat("═", reportWidth-2)
 
 	title := fmt.Sprintf("serverdoc %s · диагностика Вашего сервера", Version)
 	subtitle := fmt.Sprintf("%s · %s · %s", r.Sys.Hostname, r.Panel,
@@ -210,10 +222,61 @@ func renderHeader(p func(string, ...interface{}), r Report, c colors) {
 
 	p("")
 	p("%s╔%s╗%s", c.bold, line, c.reset)
-	p("%s║%s %s%-*s%s%s║%s", c.bold, c.reset, c.bold, width-2, title, c.reset, c.bold, c.reset)
-	p("%s║%s %-*s%s║%s", c.bold, c.reset, width-2, subtitle, c.bold, c.reset)
+	p("%s║%s %s%s%s %s║%s", c.bold, c.reset, c.bold, padRunes(title, contentWidth), c.reset, c.bold, c.reset)
+	p("%s║%s %s %s║%s", c.bold, c.reset, padRunes(subtitle, contentWidth), c.bold, c.reset)
 	p("%s╚%s╝%s", c.bold, line, c.reset)
 	p("  Статус:  %s", status)
+}
+
+// reportWidth — стандартная ширина отчёта.
+const reportWidth = 80
+
+// padRunes обрезает строку до n рун или дополняет пробелами справа.
+// Используется потому что fmt.Sprintf %-*s считает по runes ОК, но если
+// строка случайно длиннее лимита, она ломает рамку. Здесь жёстко.
+func padRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		r = r[:n-1]
+		r = append(r, '…')
+	}
+	for len(r) < n {
+		r = append(r, ' ')
+	}
+	return string(r)
+}
+
+// wrapText переносит длинный текст по словам. Возвращает срез строк, каждая
+// не длиннее width рун. Слова длиннее width оставляем как есть (не режем).
+func wrapText(s string, width int) []string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return []string{""}
+	}
+	var lines []string
+	cur := words[0]
+	curLen := runeLen(cur)
+	for _, w := range words[1:] {
+		wl := runeLen(w)
+		if curLen+1+wl <= width {
+			cur += " " + w
+			curLen += 1 + wl
+		} else {
+			lines = append(lines, cur)
+			cur = w
+			curLen = wl
+		}
+	}
+	lines = append(lines, cur)
+	return lines
+}
+
+func runeLen(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
 }
 
 func hasDiag(d diag.Report) bool {

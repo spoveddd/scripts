@@ -5,6 +5,7 @@ package notes
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"serverdoc/internal/diag"
@@ -38,7 +39,7 @@ func Collect(s sys.Info, sites []panel.Site, st stack.Stack, d diag.Report) []No
 	out = append(out, siteNotes(sites)...)
 	out = append(out, apacheNotes(d.Apache, st.Apache, s)...)
 	out = append(out, fpmDiagNotes(d.FPM, s)...)
-	out = append(out, mysqlNotes(d.MySQL, s)...)
+	out = append(out, mysqlNotes(d.MySQL, st.MySQL, s)...)
 	out = append(out, nginxConfigNotes(d.Nginx, d.Apache)...)
 	out = append(out, procsNotes(d.Procs)...)
 	out = append(out, serviceLogNotes("nginx", d.NginxLog)...)
@@ -557,7 +558,7 @@ func oomNotes(o *diag.OOMState) []Note {
 	}}
 }
 
-func mysqlNotes(m *diag.MySQLState, s sys.Info) []Note {
+func mysqlNotes(m *diag.MySQLState, srv *stack.Service, s sys.Info) []Note {
 	if m == nil {
 		return nil
 	}
@@ -638,15 +639,14 @@ func mysqlNotes(m *diag.MySQLState, s sys.Info) []Note {
 		}
 	}
 
-	// query_cache > 0 на современных MySQL (8.0+) — он удалён.
+	// query_cache_size > 0: интерпретация зависит от движка/версии:
+	//  - MySQL 8.0+: query cache физически удалён, переменная фантомная — не шумим
+	//  - MySQL 5.x: deprecated, всё ещё работает — warn если включён
+	//  - MariaDB: работает, но deprecated с 10.10 — info
 	if cfg.QueryCacheMB > 0 {
-		out = append(out, Note{
-			Severity: SevInfo,
-			Code:     "mysql_query_cache_enabled",
-			Text: fmt.Sprintf(
-				"MySQL: query_cache_size=%d MB — query cache deprecated в MySQL 5.7+ и удалён в 8.0. В новых версиях лучше 0",
-				cfg.QueryCacheMB),
-		})
+		if note := mysqlQueryCacheNote(cfg.QueryCacheMB, srv); note != nil {
+			out = append(out, *note)
+		}
 	}
 
 	// wait_timeout слишком большой — idle-соединения держат ресурсы.
@@ -670,6 +670,60 @@ func mysqlNotes(m *diag.MySQLState, s sys.Info) []Note {
 	}
 
 	return out
+}
+
+// mysqlQueryCacheNote возвращает ноту про query_cache_size с учётом движка
+// и версии. Для MySQL 8.0+ — ничего (поле фантомное, советы бессмысленны).
+func mysqlQueryCacheNote(mb int, srv *stack.Service) *Note {
+	if srv == nil {
+		return nil
+	}
+	ver := srv.Version // "8.0.44" / "11.4.5" / "10.6.25" / "5.7.42"
+	major, minor := parseVerMajMin(ver)
+
+	// MariaDB можно отличить по major >= 10 (у MySQL major 5/8).
+	isMariaDB := major >= 10
+
+	if !isMariaDB && major >= 8 {
+		// MySQL 8.0+ — переменная фантомная, не предупреждаем.
+		return nil
+	}
+
+	if isMariaDB {
+		// MariaDB 10.10+ объявил deprecated. Раньше — нормально.
+		if major > 10 || (major == 10 && minor >= 10) {
+			return &Note{
+				Severity: SevInfo,
+				Code:     "mysql_query_cache_deprecated",
+				Text: fmt.Sprintf(
+					"MariaDB %s: query_cache_size=%d MB — deprecated с 10.10. Под нагрузкой обычно медленнее (mutex contention). Рассмотрите 0",
+					ver, mb),
+			}
+		}
+		// MariaDB 10.0-10.9 — это норма, ничего не сообщаем.
+		return nil
+	}
+
+	// MySQL 5.x: deprecated, но рабочий.
+	return &Note{
+		Severity: SevWarn,
+		Code:     "mysql_query_cache_legacy",
+		Text: fmt.Sprintf(
+			"MySQL %s: query_cache_size=%d MB — deprecated в 5.7, удалён в 8.0. Под нагрузкой mutex contention; типично выставить 0",
+			ver, mb),
+	}
+}
+
+// parseVerMajMin вытаскивает major.minor из "8.0.44" / "11.4.5" / "10.6.25-MariaDB".
+func parseVerMajMin(ver string) (int, int) {
+	v := strings.SplitN(ver, "-", 2)[0]
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0
+	}
+	major, _ := strconv.Atoi(parts[0])
+	minor, _ := strconv.Atoi(parts[1])
+	return major, minor
 }
 
 func nginxConfigNotes(n *diag.NginxState, a *diag.ApacheState) []Note {

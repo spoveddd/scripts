@@ -53,6 +53,9 @@ func analyzeStuck() *StuckWorkersState {
 	}
 
 	// Кандидаты: есть во всех 3 снэпшотах, state не менялся, CPU не вырос.
+	// Для S-state дополнительно требуется наличие активного клиентского
+	// соединения — иначе worker просто idle и ждёт нового запроса от epoll,
+	// что нормально и не является зависанием.
 	type cand struct {
 		pid        int
 		first      procSnap
@@ -60,8 +63,13 @@ func analyzeStuck() *StuckWorkersState {
 		cpuTickInc int
 	}
 	var candidates []cand
+
+	// Активные TCP соединения worker'ов: socket inode → есть ESTABLISHED.
+	activeTCP := buildActiveTCPInodes()
+	// Активные unix-сокеты к php-fpm: socket inode → path сокета.
+	unixByInode := readProcNetUnix()
+
 	for pid, sFirst := range snapshots[0] {
-		// Только worker-процессы. Хотим: apache, php-fpm worker, php-cgi.
 		if !isStuckCandidate(sFirst.Cmdline) {
 			continue
 		}
@@ -74,14 +82,17 @@ func analyzeStuck() *StuckWorkersState {
 		if sFirst.State != sMid.State || sFirst.State != sLast.State {
 			continue
 		}
-		// State "R" (running) пропускаем — он легитимно работает.
 		if sFirst.State == "R" {
 			continue
 		}
-		// D-state почти всегда зависание. S-state — спим, но если CPU не растёт
-		// и есть outbound connection — тоже завис (PHP ждёт ответа).
 		cpuInc := sLast.CPUTicks - sFirst.CPUTicks
 		if cpuInc > 0 {
+			continue
+		}
+		// D-state: всегда подозрительно (uninterruptible I/O в ядре).
+		// S-state: только если воркер реально обслуживает запрос
+		// (есть активный сокет к клиенту или к upstream).
+		if sFirst.State != "D" && !hasActiveConnection(pid, activeTCP, unixByInode) {
 			continue
 		}
 		candidates = append(candidates, cand{pid: pid, first: sFirst, last: sLast, cpuTickInc: cpuInc})
@@ -89,9 +100,7 @@ func analyzeStuck() *StuckWorkersState {
 
 	// Привязка: получим карту PID → исходящие endpoints (через те же helpers).
 	outbound := outboundByPID()
-
-	// Карты для маппинга PHP-FPM unix socket → имя сайта.
-	unixByInode := readProcNetUnix()
+	// unixByInode уже построен выше; используем для маппинга PHP-FPM сокет → сайт.
 
 	for _, ca := range candidates {
 		w := StuckWorker{
@@ -304,6 +313,38 @@ func outboundByPID() map[int][]string {
 		}
 	}
 	return res
+}
+
+// buildActiveTCPInodes возвращает множество socket-inode где есть ESTABLISHED
+// соединение. SYN_SENT тоже включаем — это "висит на коннекте к upstream/api".
+// LISTEN и TIME_WAIT/CLOSE_WAIT исключаем — это не активная нагрузка.
+func buildActiveTCPInodes() map[uint64]bool {
+	res := map[uint64]bool{}
+	for _, c := range readProcNetTCP() {
+		if c.State != tcpEstablished && c.State != tcpSynSent {
+			continue
+		}
+		res[c.Inode] = true
+	}
+	return res
+}
+
+// hasActiveConnection — есть ли у процесса активное клиентское/upstream соединение.
+// Учитывает TCP ESTABLISHED/SYN_SENT и unix-сокеты к php-fpm.
+// Loopback TCP игнорируем кроме php-fpm (apache→fpm идёт через 127.0.0.1).
+func hasActiveConnection(pid int, activeTCP map[uint64]bool, unixByInode map[uint64]string) bool {
+	for _, inode := range pidSocketInodes(pid) {
+		if activeTCP[inode] {
+			return true
+		}
+		// Unix-сокет к php-fpm.
+		if path, ok := unixByInode[inode]; ok {
+			if strings.Contains(path, "fpm") || strings.Contains(path, "php") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func truncStr(s string, n int) string {

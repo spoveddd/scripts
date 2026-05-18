@@ -1,6 +1,7 @@
 package diag
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -8,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"serverdoc/internal/panel"
 )
 
 // StuckWorkersState — результат поиска зависших воркеров через сэмплинг.
@@ -42,8 +45,9 @@ const (
 // analyzeStuck делает 3 снапшота состояния процессов и находит worker'ы,
 // у которых между снэпшотами state не менялся и CPU не использовался.
 // realPools — карта version → set реальных pool names (фильтр служебных).
-// siteNames — множество доменов с панели для дополнительной проверки pool.
-func analyzeStuck(realPools map[string]map[string]bool, siteNames map[string]bool) *StuckWorkersState {
+// siteNames — множество доменов с панели для проверки pool.
+// sites — список сайтов для маппинга docroot → имя сайта.
+func analyzeStuck(realPools map[string]map[string]bool, siteNames map[string]bool, sites []panel.Site) *StuckWorkersState {
 	st := &StuckWorkersState{Samples: stuckSamples, SampleSpanMs: stuckIntervalMs * (stuckSamples - 1)}
 	snapshots := make([]map[int]procSnap, 0, stuckSamples)
 
@@ -70,9 +74,8 @@ func analyzeStuck(realPools map[string]map[string]bool, siteNames map[string]boo
 	// конкретной версии и проверить что его pool реально обслуживает сайты.
 	fpmMasters, _ := scanFPMProcesses()
 
-	// Активные TCP соединения worker'ов: socket inode → есть ESTABLISHED.
-	activeTCP := buildActiveTCPInodes()
-	// Все ESTABLISHED endpoints по inode (включая loopback) для показа "ждёт ответа".
+	// Все ESTABLISHED endpoints по inode (включая loopback) для показа "ждёт ответа"
+	// и фильтра meaningful connections.
 	allEndpoints := buildEndpointsByInode()
 	// Активные unix-сокеты: socket inode → path сокета.
 	unixByInode := readProcNetUnix()
@@ -98,10 +101,18 @@ func analyzeStuck(realPools map[string]map[string]bool, siteNames map[string]boo
 			continue
 		}
 		// D-state: всегда подозрительно (uninterruptible I/O в ядре).
-		// S-state: только если воркер реально обслуживает запрос
-		// (есть активный сокет к клиенту или к upstream).
-		if sFirst.State != "D" && !hasActiveConnection(pid, activeTCP, unixByInode) {
-			continue
+		// S-state: жёсткий фильтр — иначе ловим обычных apache/php-fpm
+		// worker'ов которые секунду обрабатывают fcgid pipe (это норма):
+		//   а) воркер должен жить > 30с (короткие запросы — не зависание);
+		//   б) И иметь external endpoint (не только loopback fcgid pipe)
+		//      ИЛИ держать ESTABLISHED unix-сокет к php-fpm.
+		if sFirst.State != "D" {
+			if procAgeSec(pid) < 30 {
+				continue
+			}
+			if !hasMeaningfulConnection(pid, allEndpoints, unixByInode) {
+				continue
+			}
 		}
 		// Фильтр: php-fpm worker из служебного пула.
 		// 1) Pool не входит в parseFPMPools этой версии (www.conf-эквивалент).
@@ -142,6 +153,10 @@ func analyzeStuck(realPools map[string]map[string]bool, siteNames map[string]boo
 		// 2) apache/php-cgi — ищем unix-сокет на php-fpm в /proc/PID/fd.
 		if w.Site == "" {
 			w.Site = siteFromPHPSocket(ca.pid, unixByInode)
+		}
+		// 3) apache+fcgid worker — pool/socket нет, но cwd обычно = docroot сайта.
+		if w.Site == "" {
+			w.Site = siteFromCWD(ca.pid, sites)
 		}
 
 		// Все активные TCP-эндпоинты (включая loopback к MySQL/Redis и т.п.) —
@@ -403,6 +418,103 @@ func isRealPool(realPools map[string]map[string]bool, version, pool string) bool
 		return true
 	}
 	return set[pool]
+}
+
+// siteFromCWD — попытка определить сайт через /proc/PID/cwd для apache/fcgid
+// worker'а. php-cgi обычно стартует с cwd=docroot, и мы можем сопоставить
+// этот путь с DocRoot одного из сайтов панели.
+func siteFromCWD(pid int, sites []panel.Site) string {
+	cwd, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/cwd")
+	if err != nil || cwd == "" {
+		return ""
+	}
+	for _, s := range sites {
+		if s.DocRoot == "" {
+			continue
+		}
+		// docroot часто с trailing slash или без — проверяем prefix.
+		if strings.HasPrefix(cwd, strings.TrimRight(s.DocRoot, "/")) {
+			return s.Name
+		}
+	}
+	return ""
+}
+
+// hasMeaningfulConnection — есть ли коннект который намекает на реальное
+// зависание (не локальный fcgid pipe):
+//   - external TCP (не loopback);
+//   - loopback к известным backend-портам (3306/5432/6379/11211/9000);
+//   - unix-сокет к php-fpm/php (apache↔fpm протокол).
+//
+// Если только loopback random-port (fcgid IPC) — это активный запрос, норма.
+func hasMeaningfulConnection(pid int, endpoints map[uint64]string, unixByInode map[uint64]string) bool {
+	for _, inode := range pidSocketInodes(pid) {
+		// Endpoint существует с известным портом — это значит wellKnownPortLabel
+		// вернул не пустоту, мы добавили "(MySQL)" и т.п. в строку.
+		if ep, ok := endpoints[inode]; ok {
+			// External коннект всегда meaningful.
+			if !strings.HasPrefix(ep, "127.") && !strings.HasPrefix(ep, "::1") {
+				return true
+			}
+			// Loopback но к known backend (см. wellKnownPortLabel).
+			if strings.Contains(ep, "(MySQL)") || strings.Contains(ep, "(PostgreSQL)") ||
+				strings.Contains(ep, "(Redis)") || strings.Contains(ep, "(memcached)") ||
+				strings.Contains(ep, "(PHP-FPM TCP)") ||
+				strings.Contains(ep, "(SMTP)") || strings.Contains(ep, "(POP3)") ||
+				strings.Contains(ep, "(IMAP)") {
+				return true
+			}
+		}
+		// Unix-сокет к php-fpm.
+		if path, ok := unixByInode[inode]; ok {
+			if strings.Contains(path, "fpm") || strings.Contains(path, "php") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// procAgeSec — сколько секунд процесс живёт. Из /proc/PID/stat поле 22
+// (starttime в clock ticks от системного бута) + /proc/uptime.
+func procAgeSec(pid int) int {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0
+	}
+	s := string(b)
+	r := strings.LastIndex(s, ")")
+	if r < 0 {
+		return 0
+	}
+	fields := strings.Fields(s[r+1:])
+	if len(fields) < 20 {
+		return 0
+	}
+	// Поле 22 в man proc; после '(comm)' это индекс 19 (0-based, со State).
+	startTicks, _ := strconv.ParseInt(fields[19], 10, 64)
+	if startTicks == 0 {
+		return 0
+	}
+	// /proc/uptime: "uptimeFloat idleFloat"
+	ub, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0
+	}
+	uf := strings.Fields(string(ub))
+	if len(uf) == 0 {
+		return 0
+	}
+	var uptime float64
+	fmt.Sscanf(uf[0], "%f", &uptime)
+	// USER_HZ обычно 100 на Linux.
+	const hz = 100
+	startSec := float64(startTicks) / hz
+	age := uptime - startSec
+	if age < 0 {
+		return 0
+	}
+	return int(age)
 }
 
 // buildActiveTCPInodes возвращает множество socket-inode где есть ESTABLISHED

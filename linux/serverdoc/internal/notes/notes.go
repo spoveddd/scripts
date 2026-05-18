@@ -256,14 +256,22 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 	var out []Note
 
 	if a.MaxRequestWorkers > 0 {
+		// Считаем безопасную рекомендуемую границу с учётом памяти:
+		// сколько вмещается в 70% RAM при текущем avg RSS воркера.
+		var recommendedMax int
+		if a.AvgWorkerRSSMB > 0 && s.MemTotalMB > 0 {
+			recommendedMax = (s.MemTotalMB * 70 / 100) / a.AvgWorkerRSSMB
+		}
 		switch {
 		case a.UtilizationPercent >= 95:
+			act := apacheMaxWorkersAction(a, recommendedMax, true)
 			out = append(out, Note{
 				Severity: SevCrit,
 				Code:     "apache_workers_saturated",
 				Text: fmt.Sprintf(
-					"Apache: %d/%d воркеров занято (%d%%) — на грани MaxRequestWorkers, новые запросы будут вставать в очередь",
+					"Apache: %d/%d воркеров занято (%d%%) — упирается в MaxRequestWorkers, новые запросы встают в очередь",
 					a.WorkersAlive, a.MaxRequestWorkers, a.UtilizationPercent),
+				Action: act,
 			})
 		case a.UtilizationPercent >= 80:
 			out = append(out, Note{
@@ -272,6 +280,7 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 				Text: fmt.Sprintf(
 					"Apache: %d/%d воркеров занято (%d%%) — приближается к лимиту MaxRequestWorkers",
 					a.WorkersAlive, a.MaxRequestWorkers, a.UtilizationPercent),
+				Action: apacheMaxWorkersAction(a, recommendedMax, false),
 			})
 		}
 	}
@@ -293,6 +302,7 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 			Text: fmt.Sprintf(
 				"Apache: MaxRequestWorkers не задан в конфигах — используется compile-time default (%d). Стоит зафиксировать явно",
 				a.MaxRequestWorkers),
+			Action: maxWorkersConfigHint(),
 		})
 	}
 
@@ -426,6 +436,66 @@ func apacheTimeoutNote(cfg diag.ApacheConfig, stk *stack.Apache) *Note {
 func dirExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+// maxWorkersConfigHint — путь файла где задавать MaxRequestWorkers
+// (зависит от ОС: Debian vs RHEL и активный MPM).
+func maxWorkersConfigHint() []string {
+	var lines []string
+	switch {
+	case dirExists("/etc/apache2/mods-enabled"):
+		lines = []string{
+			"задать явно в /etc/apache2/mods-enabled/mpm_prefork.conf",
+			"(или mpm_event.conf — смотрите какой MPM активен: apache2ctl -V):",
+			"    <IfModule mpm_prefork_module>",
+			"        ServerLimit          400",
+			"        MaxRequestWorkers    400",
+			"    </IfModule>",
+			"  затем: systemctl reload apache2",
+		}
+	case dirExists("/etc/httpd/conf.modules.d"):
+		lines = []string{
+			"задать явно в /etc/httpd/conf.modules.d/00-mpm.conf",
+			"(внутри секции <IfModule mpm_prefork_module> или _event_):",
+			"    ServerLimit          400",
+			"    MaxRequestWorkers    400",
+			"  затем: systemctl reload httpd",
+		}
+	default:
+		lines = []string{
+			"задать явно в основном конфиге Apache (httpd.conf или conf.d/*.conf):",
+			"    <IfModule mpm_prefork_module>",
+			"        ServerLimit          400",
+			"        MaxRequestWorkers    400",
+			"    </IfModule>",
+		}
+	}
+	return lines
+}
+
+// apacheMaxWorkersAction — конкретный совет по подъёму лимита воркеров.
+// Учитывает recommendedMax (исходя из доступной RAM) — чтобы не предложить
+// поднять до значения которое сразу даст OOM.
+func apacheMaxWorkersAction(a *diag.ApacheState, recommendedMax int, urgent bool) []string {
+	var out []string
+	if urgent {
+		out = append(out, "срочно одно из:")
+		out = append(out, "  1) уменьшить таймауты (FcgidIOTimeout/Timeout/BusyTimeout до 60с) — освободит зависшие")
+		out = append(out, "  2) поднять MaxRequestWorkers (если есть запас по RAM)")
+	} else {
+		out = append(out, "поднять MaxRequestWorkers с учётом памяти:")
+	}
+	target := a.MaxRequestWorkers * 2
+	if recommendedMax > 0 && recommendedMax < target {
+		target = recommendedMax
+	}
+	if a.AvgWorkerRSSMB > 0 {
+		out = append(out, fmt.Sprintf("  безопасный максимум по RAM: %d воркеров (avg RSS %d MB × max = 70%% RAM)",
+			recommendedMax, a.AvgWorkerRSSMB))
+	}
+	out = append(out, fmt.Sprintf("  рекомендуемое значение: %d", target))
+	out = append(out, maxWorkersConfigHint()...)
+	return out
 }
 
 // fcgidExtraNotes — fcgid параметры не связанные с таймаутами

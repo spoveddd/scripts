@@ -70,7 +70,7 @@ func Collect(s stack.Stack, sysInfo SysAccess, pk panel.Kind, sites []panel.Site
 	if opts.Quick {
 		r.Stuck = &StuckWorkersState{Skipped: true}
 	} else {
-		r.Stuck = analyzeStuck(realPools(r.FPM), siteNameSet(sites))
+		r.Stuck = analyzeStuck(realPools(r.FPM), siteNameSet(sites), sites)
 	}
 	return r
 }

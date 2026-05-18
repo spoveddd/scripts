@@ -44,11 +44,18 @@ func analyzeOutbound() *OutboundState {
 	}
 	locals := localIPs()
 
-	// Inode → PID. Считаем только web/script процессы — иначе мусор от ssh/mysqld.
-	pidByInode := buildInodeToPID(isWebProcess)
+	// Inode → PID. Здесь добавляем nginx — он может держать proxy_pass коннекты,
+	// плюс apache/php-fpm/php-cgi (но через isStuckCandidate — чтобы не ловить ihttpd).
+	// Сам фильтр направления "исходящее vs входящее" применяется ниже через
+	// well-known listening ports.
+	pidByInode := buildInodeToPID(isWebOrPHPProcess)
 	if len(pidByInode) == 0 {
 		return nil
 	}
+
+	// Listening порты web-сервера — чтобы отличить входящих клиентов
+	// (которых тут не должно быть) от исходящих коннектов.
+	listenPorts := listeningPorts()
 
 	st := &OutboundState{}
 	byPID := map[int]*OutboundByPID{}
@@ -60,6 +67,11 @@ func analyzeOutbound() *OutboundState {
 		}
 		// Это исходящий? Локальный IP — наш; remote — НЕ наш и не loopback.
 		if isLoopback(c.RemoteIP) || locals[c.RemoteIP.String()] {
+			continue
+		}
+		// Локальный порт совпадает с listening — это входящий клиент (accept-side),
+		// не исходящий коннект. Игнорируем — у nginx таких сотни.
+		if listenPorts[c.LocalPort] {
 			continue
 		}
 		pid, ok := pidByInode[c.Inode]
@@ -131,18 +143,39 @@ func analyzeOutbound() *OutboundState {
 	return st
 }
 
-// isWebProcess — фильтр: смотрим только apache/nginx/php-* воркеры.
-// SSH/mysqld/exim/cron исходящие коннекты в этом контексте отвлекают.
-func isWebProcess(cmdline string) bool {
+// isWebOrPHPProcess — расширенный фильтр для outbound: добавляет nginx
+// к worker-процессам apache/php (которые покрывает isStuckCandidate).
+// nginx может держать proxy_pass-коннекты к API/upstream, это важно увидеть.
+// ihttpd/containerd-shim сюда не попадают — проверка по basename бинаря.
+func isWebOrPHPProcess(cmdline string) bool {
 	if cmdline == "" {
 		return false
 	}
-	for _, k := range []string{"apache2", "httpd", "php-fpm", "php-cgi", "nginx"} {
-		if strings.Contains(cmdline, k) {
-			return true
+	if isStuckCandidate(cmdline) {
+		return true
+	}
+	fields := strings.Fields(cmdline)
+	if len(fields) == 0 {
+		return false
+	}
+	bin := fields[0]
+	if idx := strings.LastIndex(bin, "/"); idx >= 0 {
+		bin = bin[idx+1:]
+	}
+	return bin == "nginx"
+}
+
+// listeningPorts — все локальные порты в состоянии LISTEN. Используется
+// чтобы отличить accept-side соединения (клиенты к нам) от connect-side
+// (мы к внешнему миру).
+func listeningPorts() map[int]bool {
+	res := map[int]bool{}
+	for _, c := range readProcNetTCP() {
+		if c.State == tcpListen {
+			res[c.LocalPort] = true
 		}
 	}
-	return false
+	return res
 }
 
 func procName(pid int) string {

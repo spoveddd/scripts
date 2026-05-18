@@ -38,11 +38,15 @@ func Collect(s sys.Info, sites []panel.Site, st stack.Stack, d diag.Report) []No
 	out = append(out, siteNotes(sites)...)
 	out = append(out, apacheNotes(d.Apache, st.Apache, s)...)
 	out = append(out, fpmDiagNotes(d.FPM, s)...)
-	out = append(out, mysqlNotes(d.MySQL)...)
+	out = append(out, mysqlNotes(d.MySQL, s)...)
+	out = append(out, nginxConfigNotes(d.Nginx, d.Apache)...)
 	out = append(out, procsNotes(d.Procs)...)
 	out = append(out, serviceLogNotes("nginx", d.NginxLog)...)
 	out = append(out, serviceLogNotes("MySQL", d.MySQLLog)...)
 	out = append(out, oomNotes(d.OOM)...)
+	out = append(out, memoryBudgetNotes(d.Memory)...)
+	out = append(out, stuckNotes(d.Stuck)...)
+	out = append(out, outboundNotes(d.Outbound)...)
 
 	return out
 }
@@ -196,9 +200,13 @@ func siteNotes(sites []panel.Site) []Note {
 	var out []Note
 
 	disabled := 0
+	var unknown []string
 	for _, s := range sites {
 		if !s.Enabled {
 			disabled++
+		}
+		if s.Handler == panel.HandlerUnknown {
+			unknown = append(unknown, s.Name)
 		}
 	}
 	if disabled > 0 && len(sites) > 0 {
@@ -212,6 +220,19 @@ func siteNotes(sites []panel.Site) []Note {
 					disabled, len(sites), pct),
 			})
 		}
+	}
+	if len(unknown) > 0 {
+		list := strings.Join(unknown, ", ")
+		if len(list) > 160 {
+			list = list[:157] + "..."
+		}
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "sites_unknown_handler",
+			Text: fmt.Sprintf(
+				"%d сайт(ов) с непознанным handler (%s) — serverdoc не понял что это; пришлите вывод mogwai/mgrctl для этих доменов",
+				len(unknown), list),
+		})
 	}
 
 	return out
@@ -293,24 +314,31 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 			Severity: SevWarn,
 			Code:     "apache_keepalive_prefork",
 			Text: fmt.Sprintf(
-				"Apache prefork + KeepAlive On + KeepAliveTimeout %d — каждый idle-клиент держит воркер. Снизить до 2-5 или выключить KeepAlive",
+				"Apache prefork + KeepAlive On + KeepAliveTimeout=%dс — каждый idle-клиент держит занятым целый воркер пока не разорвёт соединение. Для prefork типично 2-5с или KeepAlive Off",
 				a.Config.KeepAliveTimeout),
 		})
 	}
 
-	// Большой Timeout при php_fpm/proxy — воркеры лежат пока бэкенд не ответит.
+	// Apache Timeout — конкретно объясняем что это и почему влияет на зависшие сайты.
 	if a.Config.Timeout >= 120 {
+		mpmContext := ""
+		if stk != nil && stk.MPM == "prefork" {
+			mpmContext = fmt.Sprintf(" Один зависший backend-запрос на prefork занимает воркер до %d секунд (т.е. %d минут).",
+				a.Config.Timeout, a.Config.Timeout/60)
+		}
 		out = append(out, Note{
 			Severity: SevWarn,
 			Code:     "apache_timeout_high",
 			Text: fmt.Sprintf(
-				"Apache Timeout = %d сек — при зависании бэкенда воркеры будут висеть всё это время. Типичное значение 30-60",
-				a.Config.Timeout),
+				"Apache Timeout=%dс — это таймаут на каждый запрос к backend (fcgid/proxy/php-fpm) и на чтение от клиента.%s Типичное значение 30-60с",
+				a.Config.Timeout, mpmContext),
 		})
 	}
 
-	// MPM event/worker без ThreadsPerChild — берётся compile default (25), но
-	// инженеру стоит увидеть это явно.
+	// fcgid-специфичные ноты — критичны для FastPanel/ISP с handler=fcgid.
+	out = append(out, fcgidNotes(a.Config)...)
+
+	// MPM event/worker без ThreadsPerChild — берётся compile default (25).
 	if stk != nil && (stk.MPM == "event" || stk.MPM == "worker") && a.Config.ThreadsPerChild == 0 {
 		out = append(out, Note{
 			Severity: SevInfo,
@@ -318,6 +346,65 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 			Text: fmt.Sprintf(
 				"Apache MPM %s: ThreadsPerChild не задан — используется default. Эффективная пропускная способность зависит от ServerLimit × ThreadsPerChild",
 				stk.MPM),
+		})
+	}
+
+	return out
+}
+
+func fcgidNotes(cfg diag.ApacheConfig) []Note {
+	if cfg.Fcgid == nil {
+		return nil
+	}
+	f := cfg.Fcgid
+	var out []Note
+
+	// FcgidIOTimeout — сколько fcgid ждёт ответа от php-cgi. Если > Apache Timeout,
+	// Apache сработает первым — fcgid будет молча держать backend.
+	if f.IOTimeout >= 120 {
+		extra := ""
+		if cfg.Timeout > 0 && f.IOTimeout > cfg.Timeout {
+			extra = fmt.Sprintf(" Apache Timeout=%dс меньше — Apache закроет соединение раньше, но fcgid процесс продолжит выполняться",
+				cfg.Timeout)
+		}
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "fcgid_iotimeout_high",
+			Text: fmt.Sprintf(
+				"mod_fcgid: FcgidIOTimeout=%dс — каждый зависший PHP-скрипт занимает Apache-воркер на это время.%s Типично 40-60с",
+				f.IOTimeout, extra),
+		})
+	}
+
+	// FcgidBusyTimeout (если не задан = 300с по умолчанию).
+	if f.BusyTimeout >= 300 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "fcgid_busytimeout_high",
+			Text: fmt.Sprintf(
+				"mod_fcgid: FcgidBusyTimeout=%dс — fcgid считает PHP-процесс зависшим только через это время. Снизить до 60-120с чтобы зависшие скрипты быстрее убивались",
+				f.BusyTimeout),
+		})
+	}
+
+	// FcgidMaxProcesses — общий лимит php-cgi процессов. По умолчанию 1000.
+	// На сервере с большим числом сайтов слишком маленькое значение = упор.
+	if f.MaxProcesses > 0 && f.MaxProcesses < 50 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "fcgid_max_processes_low",
+			Text: fmt.Sprintf(
+				"mod_fcgid: FcgidMaxProcesses=%d — общий лимит php-cgi процессов на весь Apache. При множестве сайтов мал — кто-то будет ждать. Дефолт 1000",
+				f.MaxProcesses),
+		})
+	}
+
+	// FcgidMaxRequestsPerProcess — аналог pm.max_requests у FPM.
+	if f.MaxRequestsPerProcess == 0 {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "fcgid_no_max_requests",
+			Text:     "mod_fcgid: FcgidMaxRequestsPerProcess не задан — php-cgi процессы не перезапускаются, утечки памяти могут накапливаться. Типично 500-10000",
 		})
 	}
 
@@ -470,7 +557,7 @@ func oomNotes(o *diag.OOMState) []Note {
 	}}
 }
 
-func mysqlNotes(m *diag.MySQLState) []Note {
+func mysqlNotes(m *diag.MySQLState, s sys.Info) []Note {
 	if m == nil {
 		return nil
 	}
@@ -480,7 +567,7 @@ func mysqlNotes(m *diag.MySQLState) []Note {
 		out = append(out, Note{
 			Severity: SevInfo,
 			Code:     "mysql_no_access",
-			Text: "MySQL: serverdoc не смог подключиться (нет socket-auth для root или .my.cnf) — диагностика БД пропущена",
+			Text:     "MySQL: serverdoc не смог подключиться (нет socket-auth для root или .my.cnf) — диагностика БД пропущена",
 		})
 		return out
 	}
@@ -516,7 +603,6 @@ func mysqlNotes(m *diag.MySQLState) []Note {
 		})
 	}
 
-	// Подозрительные state'ы: "Locked" / "Waiting for table metadata lock" / "Sending data" > 5.
 	if n := m.QueriesByState["Locked"] + m.QueriesByState["Waiting for table metadata lock"]; n > 0 {
 		out = append(out, Note{
 			Severity: SevWarn,
@@ -527,7 +613,229 @@ func mysqlNotes(m *diag.MySQLState) []Note {
 		})
 	}
 
+	cfg := m.Config
+
+	// innodb_buffer_pool_size vs RAM.
+	if cfg.InnodbBufferPoolMB > 0 && s.MemTotalMB > 0 {
+		pct := 100 * cfg.InnodbBufferPoolMB / s.MemTotalMB
+		switch {
+		case pct >= 70:
+			out = append(out, Note{
+				Severity: SevCrit,
+				Code:     "mysql_buffer_pool_oversize",
+				Text: fmt.Sprintf(
+					"MySQL: innodb_buffer_pool_size=%d MB — %d%% всей RAM (%d MB). MySQL зарезервирует это под себя — на Apache/PHP останется мало",
+					cfg.InnodbBufferPoolMB, pct, s.MemTotalMB),
+			})
+		case pct >= 50:
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "mysql_buffer_pool_large",
+				Text: fmt.Sprintf(
+					"MySQL: innodb_buffer_pool_size=%d MB — %d%% всей RAM. Проверьте что хватает остального под Apache+PHP",
+					cfg.InnodbBufferPoolMB, pct),
+			})
+		}
+	}
+
+	// query_cache > 0 на современных MySQL (8.0+) — он удалён.
+	if cfg.QueryCacheMB > 0 {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "mysql_query_cache_enabled",
+			Text: fmt.Sprintf(
+				"MySQL: query_cache_size=%d MB — query cache deprecated в MySQL 5.7+ и удалён в 8.0. В новых версиях лучше 0",
+				cfg.QueryCacheMB),
+		})
+	}
+
+	// wait_timeout слишком большой — idle-соединения держат ресурсы.
+	if cfg.WaitTimeout >= 28800 {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "mysql_wait_timeout_high",
+			Text: fmt.Sprintf(
+				"MySQL: wait_timeout=%dс (%.1fч) — idle-соединения держатся очень долго. Типично 600-1800",
+				cfg.WaitTimeout, float64(cfg.WaitTimeout)/3600),
+		})
+	}
+
+	// slow_query_log выключен — нет видимости медленных запросов.
+	if cfg.SlowQueryLog == "OFF" {
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "mysql_slow_query_disabled",
+			Text:     "MySQL: slow_query_log=OFF — нет видимости что замедляет БД. Включить и поставить long_query_time=1-3",
+		})
+	}
+
 	return out
+}
+
+func nginxConfigNotes(n *diag.NginxState, a *diag.ApacheState) []Note {
+	if n == nil {
+		return nil
+	}
+	cfg := n.Config
+	var out []Note
+
+	// Слишком мало capacity — узкое место при пике.
+	if cfg.EffectiveCapacity > 0 && cfg.EffectiveCapacity < 2048 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "nginx_capacity_low",
+			Text: fmt.Sprintf(
+				"nginx: worker_processes×worker_connections = %d одновременных соединений. При пике может стать узким местом",
+				cfg.EffectiveCapacity),
+		})
+	}
+
+	// fastcgi_read_timeout vs Apache+fcgid IOTimeout — должны быть согласованы.
+	// Если nginx закрывает раньше Apache — пользователь получает 504 пока
+	// Apache+fcgid продолжает молотить запрос.
+	if a != nil && a.Config.Fcgid != nil && cfg.FastcgiReadTimeout > 0 {
+		if a.Config.Fcgid.IOTimeout > 0 && cfg.FastcgiReadTimeout != a.Config.Fcgid.IOTimeout {
+			out = append(out, Note{
+				Severity: SevInfo,
+				Code:     "nginx_fastcgi_timeout_mismatch",
+				Text: fmt.Sprintf(
+					"nginx fastcgi_read_timeout=%dс не совпадает с Apache FcgidIOTimeout=%dс — какой-то закроет первым. Согласуйте значения",
+					cfg.FastcgiReadTimeout, a.Config.Fcgid.IOTimeout),
+			})
+		}
+	}
+
+	// worker_rlimit_nofile vs capacity.
+	if cfg.WorkerRlimitNofile > 0 && cfg.EffectiveCapacity > 0 &&
+		cfg.WorkerRlimitNofile < 2*cfg.EffectiveCapacity {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "nginx_rlimit_low",
+			Text: fmt.Sprintf(
+				"nginx: worker_rlimit_nofile=%d при capacity %d — мало. Каждое соединение = 2+ fd (клиент+upstream). Поднять до %d+",
+				cfg.WorkerRlimitNofile, cfg.EffectiveCapacity, cfg.EffectiveCapacity*2),
+		})
+	}
+
+	return out
+}
+
+func stuckNotes(s *diag.StuckWorkersState) []Note {
+	if s == nil || s.Skipped || s.StuckCount == 0 {
+		return nil
+	}
+	// Сводим: сколько с привязкой к сайту, сколько с outbound.
+	withSite, withOutbound, dState := 0, 0, 0
+	var firstWithSite, firstWithOutbound *diag.StuckWorker
+	for i := range s.Workers {
+		w := &s.Workers[i]
+		if w.Site != "" {
+			withSite++
+			if firstWithSite == nil {
+				firstWithSite = w
+			}
+		}
+		if len(w.Outbound) > 0 {
+			withOutbound++
+			if firstWithOutbound == nil {
+				firstWithOutbound = w
+			}
+		}
+		if w.State == "D" {
+			dState++
+		}
+	}
+	out := []Note{{
+		Severity: SevWarn,
+		Code:     "stuck_workers",
+		Text: fmt.Sprintf(
+			"Зависших воркеров: %d (из %d). С привязкой к сайту: %d, с открытыми исходящими: %d, в D-state: %d",
+			s.StuckCount, s.WorkersTotal, withSite, withOutbound, dState),
+	}}
+	if firstWithOutbound != nil {
+		out = append(out, Note{
+			Severity: SevCrit,
+			Code:     "stuck_with_outbound",
+			Text: fmt.Sprintf(
+				"PID %d (%s, сайт %s) висит и держит исходящий коннект на %s — почти наверняка PHP ждёт ответа внешнего сервиса",
+				firstWithOutbound.PID, firstWithOutbound.Process,
+				dash(firstWithOutbound.Site), strings.Join(firstWithOutbound.Outbound, ", ")),
+		})
+	}
+	if dState >= 3 {
+		out = append(out, Note{
+			Severity: SevCrit,
+			Code:     "stuck_dstate",
+			Text: fmt.Sprintf(
+				"%d воркеров в D-state (ждут I/O ядра) — обычно диск или сетевая ФС перегружены",
+				dState),
+		})
+	}
+	return out
+}
+
+func outboundNotes(o *diag.OutboundState) []Note {
+	if o == nil {
+		return nil
+	}
+	var out []Note
+
+	if o.TotalSynSent >= 3 {
+		out = append(out, Note{
+			Severity: SevWarn,
+			Code:     "outbound_syn_sent",
+			Text: fmt.Sprintf(
+				"%d исходящих TCP в состоянии SYN_SENT — соединения не устанавливаются (фаервол назначения / упавший remote / таймаут)",
+				o.TotalSynSent),
+		})
+	}
+
+	// Один remote endpoint собирает много коннектов — концентрированная точка отказа.
+	if len(o.TopRemotes) > 0 && o.TopRemotes[0].Count >= 5 {
+		t := o.TopRemotes[0]
+		out = append(out, Note{
+			Severity: SevInfo,
+			Code:     "outbound_concentrated",
+			Text: fmt.Sprintf(
+				"К %s держится %d исходящих коннектов от %d процессов — если этот сервис тормозит, %d воркеров висят с ним",
+				t.Endpoint, t.Count, len(t.PIDs), t.Count),
+		})
+	}
+
+	return out
+}
+
+// dash возвращает "—" если строка пустая, иначе саму строку (для notes).
+func dash(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return s
+}
+
+func memoryBudgetNotes(b *diag.MemoryBudget) []Note {
+	if b == nil || b.CommitMB == 0 {
+		return nil
+	}
+	switch {
+	case b.UtilizationPercent >= 100:
+		return []Note{{
+			Severity: SevCrit,
+			Code:     "memory_budget_overflow",
+			Text: fmt.Sprintf(
+				"Бюджет памяти при max нагрузке: %d MB при RAM %d MB (%d%%) — RAM не хватит на пике",
+				b.CommitMB, b.TotalMB, b.UtilizationPercent),
+		}}
+	case b.UtilizationPercent >= 70:
+		return []Note{{
+			Severity: SevWarn,
+			Code:     "memory_budget_tight",
+			Text: fmt.Sprintf(
+				"Бюджет памяти при max нагрузке: %d MB при RAM %d MB (%d%%) — запас по памяти невелик",
+				b.CommitMB, b.TotalMB, b.UtilizationPercent),
+		}}
+	}
+	return nil
 }
 
 func procsNotes(p *diag.ProcsState) []Note {

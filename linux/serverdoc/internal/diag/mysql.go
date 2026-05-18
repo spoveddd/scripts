@@ -1,6 +1,7 @@
 package diag
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,15 +13,33 @@ import (
 
 // MySQLState — живое состояние MySQL/MariaDB.
 type MySQLState struct {
-	AccessOK           bool         `json:"access_ok"`
-	AccessError        string       `json:"access_error,omitempty"`
-	MaxConnections     int          `json:"max_connections,omitempty"`
-	ThreadsConnected   int          `json:"threads_connected,omitempty"`
-	ThreadsRunning     int          `json:"threads_running,omitempty"`
-	UtilizationPercent int          `json:"utilization_percent,omitempty"`
+	AccessOK           bool           `json:"access_ok"`
+	AccessError        string         `json:"access_error,omitempty"`
+	MaxConnections     int            `json:"max_connections,omitempty"`
+	ThreadsConnected   int            `json:"threads_connected,omitempty"`
+	ThreadsRunning     int            `json:"threads_running,omitempty"`
+	UtilizationPercent int            `json:"utilization_percent,omitempty"`
 	QueriesByState     map[string]int `json:"queries_by_state,omitempty"`
-	LongRunning        []MySQLQuery `json:"long_running,omitempty"` // > 30 секунд
-	LongRunningCount   int          `json:"long_running_count,omitempty"`
+	LongRunning        []MySQLQuery   `json:"long_running,omitempty"` // > 30 секунд
+	LongRunningCount   int            `json:"long_running_count,omitempty"`
+	Config             MySQLConfig    `json:"config,omitempty"`
+}
+
+// MySQLConfig — критичные глобальные переменные.
+type MySQLConfig struct {
+	InnodbBufferPoolMB int     `json:"innodb_buffer_pool_mb,omitempty"`
+	InnodbLogFileMB    int     `json:"innodb_log_file_mb,omitempty"`
+	KeyBufferMB        int     `json:"key_buffer_mb,omitempty"`
+	QueryCacheMB       int     `json:"query_cache_mb,omitempty"`
+	TmpTableMB         int     `json:"tmp_table_mb,omitempty"`
+	MaxHeapTableMB     int     `json:"max_heap_table_mb,omitempty"`
+	MaxAllowedPacketMB int     `json:"max_allowed_packet_mb,omitempty"`
+	WaitTimeout        int     `json:"wait_timeout,omitempty"`
+	InteractiveTimeout int     `json:"interactive_timeout,omitempty"`
+	TableOpenCache     int     `json:"table_open_cache,omitempty"`
+	SlowQueryLog       string  `json:"slow_query_log,omitempty"` // "ON"/"OFF"
+	SlowQueryLogFile   string  `json:"slow_query_log_file,omitempty"`
+	LongQueryTime      float64 `json:"long_query_time,omitempty"`
 }
 
 // MySQLQuery — один запрос из SHOW PROCESSLIST.
@@ -62,6 +81,8 @@ func analyzeMySQL(m *stack.Service) *MySQLState {
 		st.UtilizationPercent = 100 * st.ThreadsConnected / st.MaxConnections
 	}
 
+	st.Config = readMySQLConfig()
+
 	if rows, err := mysqlQuery("SHOW FULL PROCESSLIST"); err == nil {
 		queries := parseProcesslist(rows)
 		st.QueriesByState = countQueriesByState(queries)
@@ -79,6 +100,72 @@ func analyzeMySQL(m *stack.Service) *MySQLState {
 	}
 
 	return st
+}
+
+// readMySQLConfig читает критичные глобальные переменные через один SHOW.
+func readMySQLConfig() MySQLConfig {
+	var cfg MySQLConfig
+
+	intFromBytes := func(varname string) int {
+		v, ok := mysqlVarInt(varname)
+		if !ok {
+			return 0
+		}
+		return v / (1024 * 1024)
+	}
+
+	cfg.InnodbBufferPoolMB = intFromBytes("innodb_buffer_pool_size")
+	cfg.InnodbLogFileMB = intFromBytes("innodb_log_file_size")
+	cfg.KeyBufferMB = intFromBytes("key_buffer_size")
+	cfg.QueryCacheMB = intFromBytes("query_cache_size")
+	cfg.TmpTableMB = intFromBytes("tmp_table_size")
+	cfg.MaxHeapTableMB = intFromBytes("max_heap_table_size")
+	cfg.MaxAllowedPacketMB = intFromBytes("max_allowed_packet")
+
+	if v, ok := mysqlVarInt("wait_timeout"); ok {
+		cfg.WaitTimeout = v
+	}
+	if v, ok := mysqlVarInt("interactive_timeout"); ok {
+		cfg.InteractiveTimeout = v
+	}
+	if v, ok := mysqlVarInt("table_open_cache"); ok {
+		cfg.TableOpenCache = v
+	}
+	if s, ok := mysqlVarStr("slow_query_log"); ok {
+		cfg.SlowQueryLog = strings.ToUpper(s)
+	}
+	if s, ok := mysqlVarStr("slow_query_log_file"); ok {
+		cfg.SlowQueryLogFile = s
+	}
+	if s, ok := mysqlVarStr("long_query_time"); ok {
+		var f float64
+		fmtScan(s, &f)
+		cfg.LongQueryTime = f
+	}
+	return cfg
+}
+
+// fmtScan — упрощённый Sscanf для float (стандартный Sscanf "%f" работает).
+func fmtScan(s string, f *float64) {
+	_, _ = fmt.Sscanf(s, "%f", f)
+}
+
+func mysqlVarStr(varname string) (string, bool) {
+	out, err := mysqlQuery("SHOW GLOBAL VARIABLES LIKE '" + varname + "'")
+	if err != nil {
+		return "", false
+	}
+	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(ln)
+		if len(fields) < 2 {
+			continue
+		}
+		if !strings.EqualFold(fields[0], varname) {
+			continue
+		}
+		return fields[len(fields)-1], true
+	}
+	return "", false
 }
 
 func mysqlQuery(sql string) (string, error) {

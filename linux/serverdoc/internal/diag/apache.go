@@ -34,19 +34,49 @@ type ApacheState struct {
 	NeedsAttention  bool     `json:"needs_attention"`
 }
 
-// ApacheConfig — ключевые директивы MPM/таймаутов/keepalive.
+// ApacheConfig — ключевые директивы MPM/таймаутов/keepalive + mod_fcgid + mpm_itk.
 type ApacheConfig struct {
-	StartServers           int    `json:"start_servers,omitempty"`
-	MinSpareServers        int    `json:"min_spare_servers,omitempty"`
-	MaxSpareServers        int    `json:"max_spare_servers,omitempty"`
-	ServerLimit            int    `json:"server_limit,omitempty"`
-	MaxConnectionsPerChild int    `json:"max_connections_per_child,omitempty"`
-	ThreadsPerChild        int    `json:"threads_per_child,omitempty"`
-	ThreadLimit            int    `json:"thread_limit,omitempty"`
-	Timeout                int    `json:"timeout,omitempty"`
-	KeepAlive              string `json:"keepalive,omitempty"` // "On"/"Off"
-	KeepAliveTimeout       int    `json:"keepalive_timeout,omitempty"`
-	MaxKeepAliveRequests   int    `json:"max_keepalive_requests,omitempty"`
+	// Глобальные
+	Timeout              int    `json:"timeout,omitempty"`
+	KeepAlive            string `json:"keepalive,omitempty"` // "On"/"Off"
+	KeepAliveTimeout     int    `json:"keepalive_timeout,omitempty"`
+	MaxKeepAliveRequests int    `json:"max_keepalive_requests,omitempty"`
+
+	// MPM (prefork/event/worker)
+	StartServers           int `json:"start_servers,omitempty"`
+	MinSpareServers        int `json:"min_spare_servers,omitempty"`
+	MaxSpareServers        int `json:"max_spare_servers,omitempty"`
+	ServerLimit            int `json:"server_limit,omitempty"`
+	MaxConnectionsPerChild int `json:"max_connections_per_child,omitempty"`
+	ThreadsPerChild        int `json:"threads_per_child,omitempty"`
+	ThreadLimit            int `json:"thread_limit,omitempty"`
+
+	// mod_fcgid (apache+fcgid handler — форкает php-cgi под Apache)
+	Fcgid *FcgidConfig `json:"fcgid,omitempty"`
+
+	// mpm_itk (Apache + ITK — каждый vhost под своим uid)
+	MPMITK *MPMITKConfig `json:"mpm_itk,omitempty"`
+}
+
+// FcgidConfig — параметры mod_fcgid. Все таймауты в секундах.
+type FcgidConfig struct {
+	ConnectTimeout         int `json:"connect_timeout,omitempty"`
+	IOTimeout              int `json:"io_timeout,omitempty"`
+	IdleTimeout            int `json:"idle_timeout,omitempty"`
+	BusyTimeout            int `json:"busy_timeout,omitempty"`
+	ProcessLifeTime        int `json:"process_life_time,omitempty"`
+	MaxRequestsPerProcess  int `json:"max_requests_per_process,omitempty"`
+	MaxProcesses           int `json:"max_processes,omitempty"`
+	MaxProcessesPerClass   int `json:"max_processes_per_class,omitempty"`
+}
+
+// MPMITKConfig — параметры mpm_itk. У ITK MaxRequestWorkers семантически
+// то же что в prefork (потолок воркеров на сервер), но он может быть задан
+// отдельно в секции IfModule mpm_itk_module.
+type MPMITKConfig struct {
+	MaxRequestWorkers      int `json:"max_request_workers,omitempty"`
+	MaxConnectionsPerChild int `json:"max_connections_per_child,omitempty"`
+	NiceValue              int `json:"nice_value,omitempty"`
 }
 
 func analyzeApache(a *stack.Apache) *ApacheState {
@@ -140,7 +170,7 @@ func scanApacheConfig() (ApacheConfig, int) {
 }
 
 var apacheDirectiveRe = regexp.MustCompile(
-	`(?im)^\s*(MaxRequestWorkers|MaxClients|StartServers|MinSpareServers|MaxSpareServers|ServerLimit|MaxConnectionsPerChild|MaxRequestsPerChild|ThreadsPerChild|ThreadLimit|Timeout|KeepAlive|KeepAliveTimeout|MaxKeepAliveRequests)\s+(\S+)`)
+	`(?im)^\s*(MaxRequestWorkers|MaxClients|StartServers|MinSpareServers|MaxSpareServers|ServerLimit|MaxConnectionsPerChild|MaxRequestsPerChild|ThreadsPerChild|ThreadLimit|Timeout|KeepAlive|KeepAliveTimeout|MaxKeepAliveRequests|FcgidConnectTimeout|FcgidIOTimeout|FcgidIdleTimeout|FcgidBusyTimeout|FcgidProcessLifeTime|FcgidMaxRequestsPerProcess|FcgidMaxProcesses|FcgidMaxProcessesPerClass|NiceValue)\s+(\S+)`)
 
 // parseApacheDirectives ищет директивы в одном файле. Несколько встретившихся
 // значений одной директивы — берём последнее (как Apache на самом деле).
@@ -203,8 +233,40 @@ func parseApacheDirectives(content string, cfg *ApacheConfig, maxWorkers *int) {
 			if v, err := strconv.Atoi(val); err == nil {
 				cfg.MaxKeepAliveRequests = v
 			}
+		case "fcgidconnecttimeout":
+			ensureFcgid(cfg).ConnectTimeout = atoiOr(val, 0)
+		case "fcgidiotimeout":
+			ensureFcgid(cfg).IOTimeout = atoiOr(val, 0)
+		case "fcgididletimeout":
+			ensureFcgid(cfg).IdleTimeout = atoiOr(val, 0)
+		case "fcgidbusytimeout":
+			ensureFcgid(cfg).BusyTimeout = atoiOr(val, 0)
+		case "fcgidprocesslifetime":
+			ensureFcgid(cfg).ProcessLifeTime = atoiOr(val, 0)
+		case "fcgidmaxrequestsperprocess":
+			ensureFcgid(cfg).MaxRequestsPerProcess = atoiOr(val, 0)
+		case "fcgidmaxprocesses":
+			ensureFcgid(cfg).MaxProcesses = atoiOr(val, 0)
+		case "fcgidmaxprocessesperclass":
+			ensureFcgid(cfg).MaxProcessesPerClass = atoiOr(val, 0)
+		case "nicevalue":
+			ensureITK(cfg).NiceValue = atoiOr(val, 0)
 		}
 	}
+}
+
+func ensureFcgid(cfg *ApacheConfig) *FcgidConfig {
+	if cfg.Fcgid == nil {
+		cfg.Fcgid = &FcgidConfig{}
+	}
+	return cfg.Fcgid
+}
+
+func ensureITK(cfg *ApacheConfig) *MPMITKConfig {
+	if cfg.MPMITK == nil {
+		cfg.MPMITK = &MPMITKConfig{}
+	}
+	return cfg.MPMITK
 }
 
 func findApacheErrorLog(bin string) string {

@@ -118,11 +118,19 @@ func (r Report) Text(w io.Writer, color bool) {
 	if hasDiag(r.Diag) {
 		p("")
 		p("%sДИНАМИКА%s", c.head, c.reset)
-		renderApacheDiag(p, r.Diag.Apache, c)
+		renderApacheDiag(p, r.Diag.Apache, r.Stack.Apache, c)
+		renderNginxDiag(p, r.Diag.Nginx, c)
 		renderFPMDiag(p, r.Diag.FPM, c)
 		renderMySQLDiag(p, r.Diag.MySQL, c)
 		renderProcsDiag(p, r.Diag.Procs, c)
 		renderLogsDiag(p, r.Diag.Logs, c)
+	}
+
+	// --- Память ---
+	if r.Diag.Memory != nil {
+		p("")
+		p("%sПАМЯТЬ ПРИ MAX НАГРУЗКЕ%s", c.head, c.reset)
+		renderMemoryBudget(p, r.Diag.Memory, c)
 	}
 
 	// --- Логи сервисов ---
@@ -140,6 +148,20 @@ func (r Report) Text(w io.Writer, color bool) {
 		renderOOM(p, r.Diag.OOM, c)
 	}
 
+	// --- Исходящие соединения ---
+	if r.Diag.Outbound != nil && (r.Diag.Outbound.TotalEstablished > 0 || r.Diag.Outbound.TotalSynSent > 0) {
+		p("")
+		p("%sИСХОДЯЩИЕ СОЕДИНЕНИЯ (apache/php/nginx)%s", c.head, c.reset)
+		renderOutbound(p, r.Diag.Outbound, c)
+	}
+
+	// --- Зависшие воркеры ---
+	if r.Diag.Stuck != nil {
+		p("")
+		p("%sЗАВИСАНИЯ (sampling /proc)%s", c.head, c.reset)
+		renderStuck(p, r.Diag.Stuck, c)
+	}
+
 	// --- Замечания ---
 	if len(r.Notes) > 0 {
 		p("")
@@ -150,6 +172,9 @@ func (r Report) Text(w io.Writer, color bool) {
 		}
 	}
 
+	p("")
+	p("  %sserverdoc --help для опций · --json для машинного вывода · --quick без sampling%s",
+		c.dim, c.reset)
 	p("")
 }
 
@@ -230,6 +255,107 @@ func renderServiceLog(p func(string, ...interface{}), name string, l *diag.Servi
 	}
 }
 
+func renderMemoryBudget(p func(string, ...interface{}), b *diag.MemoryBudget, c colors) {
+	col := c.ok
+	verdict := "запас есть"
+	switch {
+	case b.UtilizationPercent >= 100:
+		col, verdict = c.bad, "не хватит RAM на пике"
+	case b.UtilizationPercent >= 70:
+		col, verdict = c.warn, "запас невелик"
+	}
+	p("  Всего RAM:            %d MB", b.TotalMB)
+	if b.ApacheMaxMB > 0 {
+		p("  Apache @ max:         %d MB", b.ApacheMaxMB)
+	}
+	if b.FPMMaxMB > 0 {
+		p("  PHP-FPM @ max:        %d MB", b.FPMMaxMB)
+	}
+	if b.MySQLBufferMB > 0 {
+		p("  MySQL buffers:        %d MB", b.MySQLBufferMB)
+	}
+	if b.SystemBaseMB > 0 {
+		p("  Система (база):       %d MB", b.SystemBaseMB)
+	}
+	p("  ──────────────────────────────")
+	p("  При full load:        %s%d MB / %d MB (%d%%) — %s%s",
+		col, b.CommitMB, b.TotalMB, b.UtilizationPercent, verdict, c.reset)
+}
+
+func renderOutbound(p func(string, ...interface{}), o *diag.OutboundState, c colors) {
+	totals := fmt.Sprintf("%d ESTABLISHED", o.TotalEstablished)
+	if o.TotalSynSent > 0 {
+		totals += fmt.Sprintf(" · %s%d SYN_SENT (висят на коннекте)%s", c.warn, o.TotalSynSent, c.reset)
+	}
+	p("  %s", totals)
+	if len(o.TopProcesses) > 0 {
+		p("  По процессам:")
+		for i, pp := range o.TopProcesses {
+			if i >= 6 {
+				break
+			}
+			extras := fmt.Sprintf("%d ESTABLISHED", pp.Established)
+			if pp.SynSent > 0 {
+				extras += fmt.Sprintf(" + %s%d SYN_SENT%s", c.warn, pp.SynSent, c.reset)
+			}
+			ep := strings.Join(pp.Remotes, ", ")
+			if len(ep) > 100 {
+				ep = ep[:97] + "..."
+			}
+			p("    PID %d %s — %s → %s", pp.PID, pp.ProcessName, extras, ep)
+		}
+	}
+	if len(o.TopRemotes) > 0 {
+		p("  Топ remote endpoints:")
+		for i, r := range o.TopRemotes {
+			if i >= 5 {
+				break
+			}
+			p("    %s — %d коннектов от %d процессов", r.Endpoint, r.Count, len(r.PIDs))
+		}
+	}
+}
+
+func renderStuck(p func(string, ...interface{}), s *diag.StuckWorkersState, c colors) {
+	if s.Skipped {
+		p("  %sпропущено (--quick)%s", c.warn, c.reset)
+		return
+	}
+	p("  %d снимков /proc за %.1fс · worker-процессов %d · подозрительных %d",
+		s.Samples, float64(s.SampleSpanMs)/1000.0, s.WorkersTotal, s.StuckCount)
+	if s.WorkersTotal == 0 {
+		p("  %sworker-процессов нет — Apache/PHP не обслуживают запросы прямо сейчас%s", c.warn, c.reset)
+		return
+	}
+	if s.StuckCount == 0 {
+		p("  %sне найдено зависших — воркеры либо активны, либо нормально спят на epoll%s", c.ok, c.reset)
+		return
+	}
+	for i, w := range s.Workers {
+		if i >= 8 {
+			break
+		}
+		col := c.warn
+		if w.State == "D" {
+			col = c.bad
+		}
+		site := w.Site
+		if site == "" {
+			site = "?"
+		}
+		p("    %sPID %d %s state=%s%s · сайт: %s · wchan: %s",
+			col, w.PID, w.Process, w.State, c.reset, site, dash(w.Wchan))
+		p("      cmd: %s", w.CmdHead)
+		if len(w.Outbound) > 0 {
+			ep := strings.Join(w.Outbound, ", ")
+			if len(ep) > 120 {
+				ep = ep[:117] + "..."
+			}
+			p("      %sждёт ответа от: %s%s", c.bad, ep, c.reset)
+		}
+	}
+}
+
 func renderOOM(p func(string, ...interface{}), o *diag.OOMState, c colors) {
 	if o.Note != "" {
 		p("  %s%s%s", c.warn, o.Note, c.reset)
@@ -249,9 +375,13 @@ func renderOOM(p func(string, ...interface{}), o *diag.OOMState, c colors) {
 	}
 }
 
-func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c colors) {
+func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, stk *stack.Apache, c colors) {
 	if a == nil {
 		return
+	}
+	mpm := ""
+	if stk != nil {
+		mpm = stk.MPM
 	}
 	col := c.ok
 	if a.UtilizationPercent >= 95 {
@@ -269,9 +399,10 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c col
 	}
 	p("  Apache:  воркеров живо %d из %s", a.WorkersAlive, maxStr)
 
-	// Estimated memory at full load.
+	// Estimated memory at full load. RSS-based — реальное потребление ниже,
+	// потому что воркеры делят libphp/libapr/etc. shared memory.
 	if a.ProjectedRAMMB > 0 {
-		p("           средний RSS воркера %d MB · при полной загрузке ~%d MB",
+		p("           средний RSS %d MB · при упоре в MaxRequestWorkers ~%d MB (RSS-оценка, фактически меньше из-за shared memory)",
 			a.AvgWorkerRSSMB, a.ProjectedRAMMB)
 	}
 
@@ -279,7 +410,7 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c col
 	cfg := a.Config
 	parts := []string{}
 	if cfg.Timeout > 0 {
-		parts = append(parts, fmt.Sprintf("Timeout=%d", cfg.Timeout))
+		parts = append(parts, fmt.Sprintf("Timeout=%ds", cfg.Timeout))
 	}
 	if cfg.KeepAlive != "" {
 		ka := fmt.Sprintf("KeepAlive=%s", cfg.KeepAlive)
@@ -291,11 +422,66 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, c col
 	if cfg.MaxConnectionsPerChild > 0 {
 		parts = append(parts, fmt.Sprintf("MaxConnPerChild=%d", cfg.MaxConnectionsPerChild))
 	}
-	if cfg.ThreadsPerChild > 0 {
+	// ThreadsPerChild релевантен только для threaded MPM (event/worker).
+	// При prefork Apache его игнорирует — не зашумляем.
+	if cfg.ThreadsPerChild > 0 && (mpm == "event" || mpm == "worker") {
 		parts = append(parts, fmt.Sprintf("ThreadsPerChild=%d", cfg.ThreadsPerChild))
 	}
 	if len(parts) > 0 {
 		p("           конфиг: %s", strings.Join(parts, " · "))
+	}
+
+	// mod_fcgid — если найден в конфигах.
+	if f := cfg.Fcgid; f != nil {
+		fparts := []string{}
+		if f.IOTimeout > 0 {
+			col := ""
+			if f.IOTimeout >= 120 {
+				col = c.warn
+			}
+			fparts = append(fparts, fmt.Sprintf("%sIOTimeout=%ds%s", col, f.IOTimeout, c.reset))
+		}
+		if f.ConnectTimeout > 0 {
+			fparts = append(fparts, fmt.Sprintf("ConnectTimeout=%ds", f.ConnectTimeout))
+		}
+		if f.BusyTimeout > 0 {
+			fparts = append(fparts, fmt.Sprintf("BusyTimeout=%ds", f.BusyTimeout))
+		}
+		if f.IdleTimeout > 0 {
+			fparts = append(fparts, fmt.Sprintf("IdleTimeout=%ds", f.IdleTimeout))
+		}
+		if f.ProcessLifeTime > 0 {
+			fparts = append(fparts, fmt.Sprintf("LifeTime=%ds", f.ProcessLifeTime))
+		}
+		if f.MaxProcesses > 0 {
+			fparts = append(fparts, fmt.Sprintf("MaxProcesses=%d", f.MaxProcesses))
+		}
+		if f.MaxProcessesPerClass > 0 {
+			fparts = append(fparts, fmt.Sprintf("PerClass=%d", f.MaxProcessesPerClass))
+		}
+		if f.MaxRequestsPerProcess > 0 {
+			fparts = append(fparts, fmt.Sprintf("MaxReq=%d", f.MaxRequestsPerProcess))
+		}
+		if len(fparts) > 0 {
+			p("           fcgid:  %s", strings.Join(fparts, " · "))
+		}
+	}
+
+	// mpm_itk — если найден.
+	if itk := cfg.MPMITK; itk != nil {
+		iparts := []string{}
+		if itk.MaxRequestWorkers > 0 {
+			iparts = append(iparts, fmt.Sprintf("MaxRequestWorkers=%d", itk.MaxRequestWorkers))
+		}
+		if itk.MaxConnectionsPerChild > 0 {
+			iparts = append(iparts, fmt.Sprintf("MaxConnPerChild=%d", itk.MaxConnectionsPerChild))
+		}
+		if itk.NiceValue != 0 {
+			iparts = append(iparts, fmt.Sprintf("NiceValue=%d", itk.NiceValue))
+		}
+		if len(iparts) > 0 {
+			p("           itk:    %s", strings.Join(iparts, " · "))
+		}
 	}
 
 	if len(a.RecentMPMErrors) > 0 {
@@ -376,6 +562,33 @@ func renderMySQLDiag(p func(string, ...interface{}), m *diag.MySQLState, c color
 	}
 	p("  MySQL:   %d/%d соединений (%s%d%%%s), активных запросов %d",
 		m.ThreadsConnected, m.MaxConnections, col, m.UtilizationPercent, c.reset, m.ThreadsRunning)
+
+	// Config — компактной строкой.
+	cfg := m.Config
+	parts := []string{}
+	if cfg.InnodbBufferPoolMB > 0 {
+		parts = append(parts, fmt.Sprintf("innodb_buffer=%dMB", cfg.InnodbBufferPoolMB))
+	}
+	if cfg.KeyBufferMB > 0 {
+		parts = append(parts, fmt.Sprintf("key_buffer=%dMB", cfg.KeyBufferMB))
+	}
+	if cfg.WaitTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("wait_timeout=%ds", cfg.WaitTimeout))
+	}
+	if cfg.MaxAllowedPacketMB > 0 {
+		parts = append(parts, fmt.Sprintf("max_packet=%dMB", cfg.MaxAllowedPacketMB))
+	}
+	if cfg.SlowQueryLog != "" {
+		slow := "slow_log=" + cfg.SlowQueryLog
+		if cfg.LongQueryTime > 0 {
+			slow += fmt.Sprintf(" (long_query=%.1fs)", cfg.LongQueryTime)
+		}
+		parts = append(parts, slow)
+	}
+	if len(parts) > 0 {
+		p("           конфиг: %s", strings.Join(parts, " · "))
+	}
+
 	if m.LongRunningCount > 0 {
 		p("           %sдолгих запросов (>30с): %d%s", c.warn, m.LongRunningCount, c.reset)
 		for i, q := range m.LongRunning {
@@ -388,6 +601,38 @@ func renderMySQLDiag(p func(string, ...interface{}), m *diag.MySQLState, c color
 			}
 			p("             #%d %ds %s@%s: %s", q.ID, q.TimeSec, q.User, q.DB, info)
 		}
+	}
+}
+
+func renderNginxDiag(p func(string, ...interface{}), n *diag.NginxState, c colors) {
+	if n == nil {
+		return
+	}
+	cfg := n.Config
+	parts := []string{}
+	if cfg.WorkerProcesses != "" {
+		parts = append(parts, "worker_processes="+cfg.WorkerProcesses)
+	}
+	if cfg.WorkerConnections > 0 {
+		parts = append(parts, fmt.Sprintf("worker_connections=%d", cfg.WorkerConnections))
+	}
+	if cfg.EffectiveCapacity > 0 {
+		parts = append(parts, fmt.Sprintf("capacity=%d", cfg.EffectiveCapacity))
+	}
+	if cfg.FastcgiReadTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("fastcgi_read_timeout=%ds", cfg.FastcgiReadTimeout))
+	}
+	if cfg.ProxyReadTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("proxy_read_timeout=%ds", cfg.ProxyReadTimeout))
+	}
+	if cfg.KeepaliveTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("keepalive_timeout=%ds", cfg.KeepaliveTimeout))
+	}
+	if cfg.ClientMaxBodySize != "" {
+		parts = append(parts, "client_max_body="+cfg.ClientMaxBodySize)
+	}
+	if len(parts) > 0 {
+		p("  nginx:   %s", strings.Join(parts, " · "))
 	}
 }
 
@@ -454,7 +699,10 @@ func orderNotes(in []notes.Note) []notes.Note {
 	out := make([]notes.Note, len(in))
 	copy(out, in)
 	sort.SliceStable(out, func(i, j int) bool {
-		return rank[out[i].Severity] < rank[out[j].Severity]
+		if a, b := rank[out[i].Severity], rank[out[j].Severity]; a != b {
+			return a < b
+		}
+		return out[i].Code < out[j].Code
 	})
 	return out
 }
@@ -470,18 +718,24 @@ func severityMarker(s notes.Severity, c colors) (string, string) {
 	}
 }
 
-// renderPHP печатает PHP-версии, сворачивая "пустые" (master запущен,
-// 0 пулов, 0 сайтов на этой версии) в одну строку.
+// renderPHP печатает PHP-версии, сворачивая шумные категории в одну строку
+// каждая: "idle masters" (запущены, никем не используются — съедают RAM)
+// и "dormant" (установлены, не запущены, не используются — alt-php пакеты).
 func renderPHP(p func(string, ...interface{}), php []stack.PHPVersion, byPHP map[string]int, c colors) {
 	if len(php) == 0 {
 		p("  PHP-FPM: не обнаружен")
 		return
 	}
 
-	var empty []string
+	var idle, dormant []string
 	for _, v := range php {
-		if v.MasterRunning && v.Pools == 0 && byPHP[v.Version] == 0 {
-			empty = append(empty, v.Version)
+		unused := v.Pools == 0 && byPHP[v.Version] == 0
+		if unused && v.MasterRunning {
+			idle = append(idle, v.Version)
+			continue
+		}
+		if unused && !v.MasterRunning {
+			dormant = append(dormant, v.Version)
 			continue
 		}
 		state := c.warn + "master не запущен" + c.reset
@@ -494,9 +748,12 @@ func renderPHP(p func(string, ...interface{}), php []stack.PHPVersion, byPHP map
 		}
 		p("  PHP %s: %d пулов · %s%s", v.Version, v.Pools, state, src)
 	}
-	if len(empty) > 0 {
-		p("  PHP %s: установлены, без пулов и сайтов · %smaster запущен%s",
-			strings.Join(empty, ", "), c.ok, c.reset)
+	if len(idle) > 0 {
+		p("  PHP %s: %smaster запущен, но не обслуживает сайты%s",
+			strings.Join(idle, ", "), c.warn, c.reset)
+	}
+	if len(dormant) > 0 {
+		p("  PHP %s: установлены, не запущены, без сайтов", strings.Join(dormant, ", "))
 	}
 }
 
@@ -504,7 +761,7 @@ func renderPHP(p func(string, ...interface{}), php []stack.PHPVersion, byPHP map
 // Хелперы вывода
 // ---------------------------------------------------------------------------
 
-type colors struct{ bold, reset, head, warn, ok, bad string }
+type colors struct{ bold, reset, head, warn, ok, bad, dim string }
 
 func palette(on bool) colors {
 	if !on {
@@ -517,6 +774,7 @@ func palette(on bool) colors {
 		warn:  "\033[33m",
 		ok:    "\033[32m",
 		bad:   "\033[31m",
+		dim:   "\033[2m",
 	}
 }
 

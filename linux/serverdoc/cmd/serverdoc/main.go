@@ -19,9 +19,11 @@ import (
 var version = "dev"
 
 func main() {
-	asJSON := flag.Bool("json", false, "вывод в формате JSON")
-	noColor := flag.Bool("no-color", false, "отключить цветной вывод")
+	asJSON := flag.Bool("json", false, "вывод в формате JSON (для скриптов и парсинга)")
+	noColor := flag.Bool("no-color", false, "отключить ANSI-цвета (для записи в файл)")
+	quick := flag.Bool("quick", false, "пропустить sampling зависших воркеров (быстрее на ~3с)")
 	showVer := flag.Bool("version", false, "показать версию и выйти")
+	flag.Usage = printUsage
 	flag.Parse()
 
 	if *showVer {
@@ -37,7 +39,7 @@ func main() {
 		warn = "не удалось получить список сайтов: " + err.Error()
 	}
 	st := stack.Collect()
-	d := diag.Collect(st, pk, sites)
+	d := diag.Collect(st, diag.SysAccess{MemTotalMB: info.MemTotalMB}, pk, sites, diag.Options{Quick: *quick})
 
 	rep := report.Report{
 		Sys:      info,
@@ -63,4 +65,27 @@ func isTerminal(f *os.File) bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `serverdoc — диагностика серверов с панелями ISPmanager/FastPanel/HestiaCP.
+
+Запускать от root: для доступа к CLI панелей, /proc других процессов и MySQL
+через socket-auth.
+
+Использование:
+  serverdoc                  — полный отчёт (с sampling зависших воркеров, ~3с)
+  serverdoc --quick          — быстрый отчёт без sampling
+  serverdoc --json           — машинный формат для скриптов
+  serverdoc --no-color       — без ANSI-цветов (для записи в файл)
+  serverdoc --version        — версия и выход
+
+Примеры:
+  serverdoc                          # стандартный запуск
+  serverdoc --json > report.json     # сохранить структурный отчёт
+  serverdoc --no-color > report.txt  # сохранить текстовый отчёт
+  serverdoc --quick                  # когда нужно быстро без 3-сек паузы
+
+Документация и issues: https://github.com/spoveddd/scripts/tree/main/linux/serverdoc
+`)
 }

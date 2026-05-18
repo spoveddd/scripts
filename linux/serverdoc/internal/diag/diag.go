@@ -68,9 +68,24 @@ func Collect(s stack.Stack, sysInfo SysAccess, pk panel.Kind, sites []panel.Site
 	if opts.Quick {
 		r.Stuck = &StuckWorkersState{Skipped: true}
 	} else {
-		r.Stuck = analyzeStuck()
+		r.Stuck = analyzeStuck(realPools(r.FPM))
 	}
 	return r
+}
+
+// realPools — карта version → set of реальных pool names (исключает www.conf
+// и подобные служебные). Используется в stuck detector чтобы игнорировать
+// worker'ов системных пулов которые не обслуживают сайты.
+func realPools(fpm []FPMState) map[string]map[string]bool {
+	res := map[string]map[string]bool{}
+	for _, v := range fpm {
+		set := map[string]bool{}
+		for _, p := range v.Pools {
+			set[p.Name] = true
+		}
+		res[v.Version] = set
+	}
+	return res
 }
 
 // SysAccess — минимум что нужно diag из sys.Info (без импорта sys —

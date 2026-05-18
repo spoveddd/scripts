@@ -246,6 +246,33 @@ func padRunes(s string, n int) string {
 	return string(r)
 }
 
+// printJoined печатает строку "label: a · b · c" с переносом частей на
+// следующую строку если общая длина больше maxWidth рун. Continuation
+// выравнивается под содержимое (длина label + ": " пробелов).
+// Это нужно чтобы конфиг-параметры (Timeout, KeepAlive, fcgid, mysql conf и т.п.)
+// не вылезали за ширину отчёта.
+func printJoined(p func(string, ...interface{}), prefix string, parts []string, maxWidth int) {
+	if len(parts) == 0 {
+		return
+	}
+	indent := strings.Repeat(" ", runeLen(prefix))
+	cur := prefix + parts[0]
+	curLen := runeLen(cur)
+	for _, part := range parts[1:] {
+		seg := " · " + part
+		segLen := runeLen(seg)
+		if curLen+segLen > maxWidth {
+			p("%s", cur)
+			cur = indent + part
+			curLen = runeLen(cur)
+		} else {
+			cur += seg
+			curLen += segLen
+		}
+	}
+	p("%s", cur)
+}
+
 // wrapText переносит длинный текст по словам. Возвращает срез строк, каждая
 // не длиннее width рун. Слова длиннее width оставляем как есть (не режем).
 func wrapText(s string, width int) []string {
@@ -462,10 +489,10 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, stk *
 	}
 	p("  Apache:  воркеров живо %d из %s", a.WorkersAlive, maxStr)
 
-	// Estimated memory at full load. RSS-based — реальное потребление ниже,
-	// потому что воркеры делят libphp/libapr/etc. shared memory.
+	// Estimated memory at full load. RSS-based — реальное потребление ниже
+	// из-за shared memory (libphp/libapr).
 	if a.ProjectedRAMMB > 0 {
-		p("           средний RSS %d MB · при упоре в MaxRequestWorkers ~%d MB (RSS-оценка, фактически меньше из-за shared memory)",
+		p("           средний RSS %d MB · при упоре ~%d MB (RSS-оценка, реально меньше)",
 			a.AvgWorkerRSSMB, a.ProjectedRAMMB)
 	}
 
@@ -491,7 +518,7 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, stk *
 		parts = append(parts, fmt.Sprintf("ThreadsPerChild=%d", cfg.ThreadsPerChild))
 	}
 	if len(parts) > 0 {
-		p("           конфиг: %s", strings.Join(parts, " · "))
+		printJoined(p, "           конфиг: ", parts, reportWidth)
 	}
 
 	// mod_fcgid — если найден в конфигах.
@@ -526,7 +553,7 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, stk *
 			fparts = append(fparts, fmt.Sprintf("MaxReq=%d", f.MaxRequestsPerProcess))
 		}
 		if len(fparts) > 0 {
-			p("           fcgid:  %s", strings.Join(fparts, " · "))
+			printJoined(p, "           fcgid:  ", fparts, reportWidth)
 		}
 	}
 
@@ -543,7 +570,7 @@ func renderApacheDiag(p func(string, ...interface{}), a *diag.ApacheState, stk *
 			iparts = append(iparts, fmt.Sprintf("NiceValue=%d", itk.NiceValue))
 		}
 		if len(iparts) > 0 {
-			p("           itk:    %s", strings.Join(iparts, " · "))
+			printJoined(p, "           itk:    ", iparts, reportWidth)
 		}
 	}
 
@@ -649,7 +676,7 @@ func renderMySQLDiag(p func(string, ...interface{}), m *diag.MySQLState, c color
 		parts = append(parts, slow)
 	}
 	if len(parts) > 0 {
-		p("           конфиг: %s", strings.Join(parts, " · "))
+		printJoined(p, "           конфиг: ", parts, reportWidth)
 	}
 
 	if m.LongRunningCount > 0 {
@@ -695,7 +722,7 @@ func renderNginxDiag(p func(string, ...interface{}), n *diag.NginxState, c color
 		parts = append(parts, "client_max_body="+cfg.ClientMaxBodySize)
 	}
 	if len(parts) > 0 {
-		p("  nginx:   %s", strings.Join(parts, " · "))
+		printJoined(p, "  nginx:   ", parts, reportWidth)
 	}
 }
 

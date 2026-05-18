@@ -41,7 +41,8 @@ const (
 
 // analyzeStuck делает 3 снапшота состояния процессов и находит worker'ы,
 // у которых между снэпшотами state не менялся и CPU не использовался.
-func analyzeStuck() *StuckWorkersState {
+// realPools — карта version → set of реальных pool names (для фильтра служебных).
+func analyzeStuck(realPools map[string]map[string]bool) *StuckWorkersState {
 	st := &StuckWorkersState{Samples: stuckSamples, SampleSpanMs: stuckIntervalMs * (stuckSamples - 1)}
 	snapshots := make([]map[int]procSnap, 0, stuckSamples)
 
@@ -64,9 +65,15 @@ func analyzeStuck() *StuckWorkersState {
 	}
 	var candidates []cand
 
+	// Карта master PID → версия PHP. Нужна чтобы привязать worker'а к
+	// конкретной версии и проверить что его pool реально обслуживает сайты.
+	fpmMasters, _ := scanFPMProcesses()
+
 	// Активные TCP соединения worker'ов: socket inode → есть ESTABLISHED.
 	activeTCP := buildActiveTCPInodes()
-	// Активные unix-сокеты к php-fpm: socket inode → path сокета.
+	// Все ESTABLISHED endpoints по inode (включая loopback) для показа "ждёт ответа".
+	allEndpoints := buildEndpointsByInode()
+	// Активные unix-сокеты: socket inode → path сокета.
 	unixByInode := readProcNetUnix()
 
 	for pid, sFirst := range snapshots[0] {
@@ -95,11 +102,18 @@ func analyzeStuck() *StuckWorkersState {
 		if sFirst.State != "D" && !hasActiveConnection(pid, activeTCP, unixByInode) {
 			continue
 		}
+		// Фильтр: php-fpm worker из служебного пула (не относится к клиентским
+		// сайтам — типа www.conf default pool). Игнорируем, чтобы не шуметь.
+		if m := fpmPoolCmdRe.FindStringSubmatch(sFirst.Cmdline); m != nil {
+			pool := m[1]
+			ver := fpmMasters[procPPID(pid)]
+			if !isRealPool(realPools, ver, pool) {
+				continue
+			}
+		}
 		candidates = append(candidates, cand{pid: pid, first: sFirst, last: sLast, cpuTickInc: cpuInc})
 	}
 
-	// Привязка: получим карту PID → исходящие endpoints (через те же helpers).
-	outbound := outboundByPID()
 	// unixByInode уже построен выше; используем для маппинга PHP-FPM сокет → сайт.
 
 	for _, ca := range candidates {
@@ -124,9 +138,13 @@ func analyzeStuck() *StuckWorkersState {
 			w.Site = siteFromPHPSocket(ca.pid, unixByInode)
 		}
 
-		// Исходящие endpoints. Только ESTABLISHED + SYN_SENT — то что зависает.
-		if eps, ok := outbound[ca.pid]; ok {
-			w.Outbound = eps
+		// Все активные TCP-эндпоинты (включая loopback к MySQL/Redis и т.п.) —
+		// это то, ОТ ЧЕГО воркер сейчас ждёт ответа.
+		w.Outbound = endpointsForPID(ca.pid, allEndpoints)
+		// Если PHP-FPM worker и pool name всё ещё не совпадает с сайтом —
+		// пометим его явно "пул=X" чтобы инженер понял что pool это служебное имя.
+		if w.Site == "" && w.Pool != "" {
+			w.Site = "(пул " + w.Pool + ")"
 		}
 
 		st.Workers = append(st.Workers, w)
@@ -282,37 +300,82 @@ func siteFromPHPSocket(pid int, unixByInode map[uint64]string) string {
 	return ""
 }
 
-// outboundByPID возвращает карту PID → формализованный список endpoint'ов
-// (для интеграции в зависшие воркеры). Тут не нужны топы — просто per-PID.
-func outboundByPID() map[int][]string {
-	conns := readProcNetTCP()
-	if len(conns) == 0 {
-		return nil
-	}
-	locals := localIPs()
-	pidByInode := buildInodeToPID(isStuckCandidate)
-
-	res := map[int][]string{}
-	for _, c := range conns {
+// buildEndpointsByInode возвращает карту socket inode → описание remote endpoint
+// для ESTABLISHED/SYN_SENT соединений. Включает loopback (это важно — MySQL/
+// Redis обычно слушают 127.0.0.1, и если PHP завис на ответе от БД, нам надо
+// это увидеть). Известные порты подписываются (3306=MySQL и т.д.).
+func buildEndpointsByInode() map[uint64]string {
+	res := map[uint64]string{}
+	for _, c := range readProcNetTCP() {
 		if c.State != tcpEstablished && c.State != tcpSynSent {
 			continue
 		}
-		if isLoopback(c.RemoteIP) || locals[c.RemoteIP.String()] {
-			continue
-		}
-		pid, ok := pidByInode[c.Inode]
-		if !ok {
-			continue
-		}
+		label := wellKnownPortLabel(c.RemotePort)
 		ep := c.RemoteIP.String() + ":" + strconv.Itoa(c.RemotePort)
+		if label != "" {
+			ep += " " + label
+		}
 		if c.State == tcpSynSent {
-			ep += " (SYN_SENT)"
+			ep += " [SYN_SENT]"
 		}
-		if !contains(res[pid], ep) {
-			res[pid] = append(res[pid], ep)
-		}
+		res[c.Inode] = ep
 	}
 	return res
+}
+
+// endpointsForPID возвращает remote endpoints всех ESTABLISHED/SYN_SENT
+// сокетов открытых процессом. Дедуплицируется по endpoint-строке.
+func endpointsForPID(pid int, endpoints map[uint64]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, inode := range pidSocketInodes(pid) {
+		if ep, ok := endpoints[inode]; ok && !seen[ep] {
+			seen[ep] = true
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+// wellKnownPortLabel — лейбл для распространённых хостинговых backend-портов.
+func wellKnownPortLabel(port int) string {
+	switch port {
+	case 3306:
+		return "(MySQL)"
+	case 5432:
+		return "(PostgreSQL)"
+	case 6379:
+		return "(Redis)"
+	case 11211:
+		return "(memcached)"
+	case 9000:
+		return "(PHP-FPM TCP)"
+	case 25, 465, 587:
+		return "(SMTP)"
+	case 110, 995:
+		return "(POP3)"
+	case 143, 993:
+		return "(IMAP)"
+	case 80:
+		return "(HTTP)"
+	case 443:
+		return "(HTTPS)"
+	}
+	return ""
+}
+
+// isRealPool проверяет что worker'ский pool name относится к реальному сайту,
+// а не к служебному пулу (типа www.conf у Debian-PHP который мы исключаем
+// из реальных пулов).
+func isRealPool(realPools map[string]map[string]bool, version, pool string) bool {
+	if realPools == nil {
+		return true // без контекста — не фильтруем
+	}
+	set, ok := realPools[version]
+	if !ok {
+		return true
+	}
+	return set[pool]
 }
 
 // buildActiveTCPInodes возвращает множество socket-inode где есть ESTABLISHED

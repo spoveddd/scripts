@@ -112,16 +112,23 @@ func phpFPMNotes(sites []panel.Site, php []stack.PHPVersion) []Note {
 		})
 	}
 
+	// Сворачиваем "pool есть, master не запущен" во одну сводную ноту —
+	// иначе на alt-php серверах (с 10+ предустановленными версиями) генерируется
+	// длинный шум, который заслоняет важное.
+	var orphan []string
 	for _, p := range php {
 		if p.MasterRunning || p.Pools == 0 {
 			continue
 		}
+		orphan = append(orphan, p.Version)
+	}
+	if len(orphan) > 0 {
 		out = append(out, Note{
 			Severity: SevWarn,
 			Code:     "php_fpm_pools_orphan",
 			Text: fmt.Sprintf(
-				"PHP %s: %d пулов в %s, master не запущен — конфиги без процесса",
-				p.Version, p.Pools, p.PoolDir),
+				"PHP %s: пулы есть, master не запущен — конфиги без процесса (alt-php установлен, fpm выключен)",
+				strings.Join(orphan, ", ")),
 		})
 	}
 
@@ -320,24 +327,15 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 		})
 	}
 
-	// Apache Timeout — конкретно объясняем что это и почему влияет на зависшие сайты.
-	if a.Config.Timeout >= 120 {
-		mpmContext := ""
-		if stk != nil && stk.MPM == "prefork" {
-			mpmContext = fmt.Sprintf(" Один зависший backend-запрос на prefork занимает воркер до %d секунд (т.е. %d минут).",
-				a.Config.Timeout, a.Config.Timeout/60)
-		}
-		out = append(out, Note{
-			Severity: SevWarn,
-			Code:     "apache_timeout_high",
-			Text: fmt.Sprintf(
-				"Apache Timeout=%dс — это таймаут на каждый запрос к backend (fcgid/proxy/php-fpm) и на чтение от клиента.%s Типичное значение 30-60с",
-				a.Config.Timeout, mpmContext),
-		})
+	// Объединённая нота про таймауты Apache+fcgid: вместо 3 отдельных
+	// (Timeout, FcgidIOTimeout, FcgidBusyTimeout) — одна сводная,
+	// потому что инженер всё равно меняет их вместе.
+	if n := apacheTimeoutNote(a.Config, stk); n != nil {
+		out = append(out, *n)
 	}
 
-	// fcgid-специфичные ноты — критичны для FastPanel/ISP с handler=fcgid.
-	out = append(out, fcgidNotes(a.Config)...)
+	// Дополнительные fcgid-ноты (не про таймауты).
+	out = append(out, fcgidExtraNotes(a.Config)...)
 
 	// MPM event/worker без ThreadsPerChild — берётся compile default (25).
 	if stk != nil && (stk.MPM == "event" || stk.MPM == "worker") && a.Config.ThreadsPerChild == 0 {
@@ -353,54 +351,74 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 	return out
 }
 
-func fcgidNotes(cfg diag.ApacheConfig) []Note {
+// apacheTimeoutNote собирает все таймаутные параметры Apache+fcgid в одну
+// сводную ноту. Вместо 3 отдельных предупреждений (которые читаются как "три
+// разные проблемы") даёт цельную картину "сколько секунд PHP может тупить".
+func apacheTimeoutNote(cfg diag.ApacheConfig, stk *stack.Apache) *Note {
+	timeout := cfg.Timeout
+	var ioTimeout, busyTimeout int
+	if cfg.Fcgid != nil {
+		ioTimeout = cfg.Fcgid.IOTimeout
+		busyTimeout = cfg.Fcgid.BusyTimeout
+	}
+	if timeout < 120 && ioTimeout < 120 && busyTimeout < 300 {
+		return nil
+	}
+
+	// Максимум — реальная "стоимость" одного зависшего запроса.
+	worst := timeout
+	if ioTimeout > worst {
+		worst = ioTimeout
+	}
+	if busyTimeout > worst {
+		worst = busyTimeout
+	}
+
+	parts := []string{}
+	if timeout > 0 {
+		parts = append(parts, fmt.Sprintf("Apache Timeout=%dс", timeout))
+	}
+	if ioTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("FcgidIOTimeout=%dс", ioTimeout))
+	}
+	if busyTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("FcgidBusyTimeout=%dс", busyTimeout))
+	}
+
+	mpmContext := ""
+	if stk != nil && stk.MPM == "prefork" {
+		mpmContext = fmt.Sprintf(" При prefork один зависший запрос занимает воркер до %d мин",
+			worst/60)
+	}
+
+	return &Note{
+		Severity: SevWarn,
+		Code:     "apache_timeouts_high",
+		Text: fmt.Sprintf(
+			"Таймауты Apache/fcgid завышены (%s) — зависший backend держит воркер до %dс.%s Типично 30-60с",
+			strings.Join(parts, ", "), worst, mpmContext),
+	}
+}
+
+// fcgidExtraNotes — fcgid параметры не связанные с таймаутами
+// (MaxProcesses, MaxRequestsPerProcess).
+func fcgidExtraNotes(cfg diag.ApacheConfig) []Note {
 	if cfg.Fcgid == nil {
 		return nil
 	}
 	f := cfg.Fcgid
 	var out []Note
 
-	// FcgidIOTimeout — сколько fcgid ждёт ответа от php-cgi. Если > Apache Timeout,
-	// Apache сработает первым — fcgid будет молча держать backend.
-	if f.IOTimeout >= 120 {
-		extra := ""
-		if cfg.Timeout > 0 && f.IOTimeout > cfg.Timeout {
-			extra = fmt.Sprintf(" Apache Timeout=%dс меньше — Apache закроет соединение раньше, но fcgid процесс продолжит выполняться",
-				cfg.Timeout)
-		}
-		out = append(out, Note{
-			Severity: SevWarn,
-			Code:     "fcgid_iotimeout_high",
-			Text: fmt.Sprintf(
-				"mod_fcgid: FcgidIOTimeout=%dс — каждый зависший PHP-скрипт занимает Apache-воркер на это время.%s Типично 40-60с",
-				f.IOTimeout, extra),
-		})
-	}
-
-	// FcgidBusyTimeout (если не задан = 300с по умолчанию).
-	if f.BusyTimeout >= 300 {
-		out = append(out, Note{
-			Severity: SevWarn,
-			Code:     "fcgid_busytimeout_high",
-			Text: fmt.Sprintf(
-				"mod_fcgid: FcgidBusyTimeout=%dс — fcgid считает PHP-процесс зависшим только через это время. Снизить до 60-120с чтобы зависшие скрипты быстрее убивались",
-				f.BusyTimeout),
-		})
-	}
-
-	// FcgidMaxProcesses — общий лимит php-cgi процессов. По умолчанию 1000.
-	// На сервере с большим числом сайтов слишком маленькое значение = упор.
 	if f.MaxProcesses > 0 && f.MaxProcesses < 50 {
 		out = append(out, Note{
 			Severity: SevWarn,
 			Code:     "fcgid_max_processes_low",
 			Text: fmt.Sprintf(
-				"mod_fcgid: FcgidMaxProcesses=%d — общий лимит php-cgi процессов на весь Apache. При множестве сайтов мал — кто-то будет ждать. Дефолт 1000",
+				"mod_fcgid: FcgidMaxProcesses=%d — общий лимит php-cgi на весь Apache. При множестве сайтов мал — кто-то будет ждать. Дефолт 1000",
 				f.MaxProcesses),
 		})
 	}
 
-	// FcgidMaxRequestsPerProcess — аналог pm.max_requests у FPM.
 	if f.MaxRequestsPerProcess == 0 {
 		out = append(out, Note{
 			Severity: SevInfo,

@@ -57,6 +57,9 @@ func (r Report) Text(w io.Writer, color bool) {
 	} else {
 		p("  Swap:    отсутствует")
 	}
+	if s.HasDocker {
+		p("  Docker:  обнаружен — некоторые процессы могут быть из контейнеров")
+	}
 
 	// --- Панель и сайты ---
 	p("")

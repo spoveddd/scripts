@@ -87,11 +87,16 @@ func analyzeMySQL(m *stack.Service) *MySQLState {
 		queries := parseProcesslist(rows)
 		st.QueriesByState = countQueriesByState(queries)
 		for _, q := range queries {
-			if q.TimeSec >= 30 && q.Command != "Sleep" {
-				st.LongRunningCount++
-				if len(st.LongRunning) < 10 {
-					st.LongRunning = append(st.LongRunning, q)
-				}
+			if q.TimeSec < 30 || q.Command == "Sleep" {
+				continue
+			}
+			// Системные потоки висят вечно по дизайну — не считаем их runaway.
+			if isSystemMySQLUser(q.User) {
+				continue
+			}
+			st.LongRunningCount++
+			if len(st.LongRunning) < 10 {
+				st.LongRunning = append(st.LongRunning, q)
 			}
 		}
 		sort.SliceStable(st.LongRunning, func(i, j int) bool {
@@ -257,6 +262,16 @@ func nullify(s string) string {
 		return ""
 	}
 	return s
+}
+
+// isSystemMySQLUser — внутренние пользователи MySQL/MariaDB, чьи "запросы"
+// в processlist это вечные системные потоки (event scheduler, репликация и т.п.).
+func isSystemMySQLUser(user string) bool {
+	switch user {
+	case "event_scheduler", "system user":
+		return true
+	}
+	return false
 }
 
 // compactErr вырезает многострочные mysql-сообщения и оставляет первую строку.

@@ -68,9 +68,20 @@ func Collect(s stack.Stack, sysInfo SysAccess, pk panel.Kind, sites []panel.Site
 	if opts.Quick {
 		r.Stuck = &StuckWorkersState{Skipped: true}
 	} else {
-		r.Stuck = analyzeStuck(realPools(r.FPM))
+		r.Stuck = analyzeStuck(realPools(r.FPM), siteNameSet(sites))
 	}
 	return r
+}
+
+// siteNameSet — множество доменов с панели. Нужно чтобы отличать клиентские
+// пулы php-fpm (имя совпадает с доменом) от служебных (www-data, www, apps),
+// у которых имя совпадает с системным юзером, а не сайтом.
+func siteNameSet(sites []panel.Site) map[string]bool {
+	res := map[string]bool{}
+	for _, s := range sites {
+		res[s.Name] = true
+	}
+	return res
 }
 
 // realPools — карта version → set of реальных pool names (исключает www.conf

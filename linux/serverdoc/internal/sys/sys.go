@@ -40,6 +40,7 @@ type Info struct {
 	SwapTotalMB int    `json:"swap_total_mb"`
 	SwapFreeMB  int    `json:"swap_free_mb"`
 	Load1       string `json:"load1"`
+	HasDocker   bool   `json:"has_docker,omitempty"`
 }
 
 // Collect собирает Info из /proc и /etc/os-release.
@@ -51,7 +52,20 @@ func Collect() Info {
 	i.CPUCount = runtime.NumCPU()
 	i.MemTotalMB, i.MemAvailMB, i.SwapTotalMB, i.SwapFreeMB = meminfo()
 	i.Load1 = load1()
+	i.HasDocker = hasDocker()
 	return i
+}
+
+// hasDocker — есть ли на хосте Docker daemon (через сокет).
+// Помогает интерпретировать top RAM: mariadbd рядом с mysqld обычно
+// значит что один из них в контейнере.
+func hasDocker() bool {
+	for _, p := range []string{"/var/run/docker.sock", "/run/docker.sock"} {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func readFile(p string) string {

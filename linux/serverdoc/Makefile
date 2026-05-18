@@ -1,5 +1,5 @@
 BINARY  := serverdoc
-VERSION := 0.3.9
+VERSION := 0.3.10
 
 # Локальная сборка под текущую систему
 build:

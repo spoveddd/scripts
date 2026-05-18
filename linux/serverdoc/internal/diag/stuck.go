@@ -41,8 +41,9 @@ const (
 
 // analyzeStuck делает 3 снапшота состояния процессов и находит worker'ы,
 // у которых между снэпшотами state не менялся и CPU не использовался.
-// realPools — карта version → set of реальных pool names (для фильтра служебных).
-func analyzeStuck(realPools map[string]map[string]bool) *StuckWorkersState {
+// realPools — карта version → set реальных pool names (фильтр служебных).
+// siteNames — множество доменов с панели для дополнительной проверки pool.
+func analyzeStuck(realPools map[string]map[string]bool, siteNames map[string]bool) *StuckWorkersState {
 	st := &StuckWorkersState{Samples: stuckSamples, SampleSpanMs: stuckIntervalMs * (stuckSamples - 1)}
 	snapshots := make([]map[int]procSnap, 0, stuckSamples)
 
@@ -102,12 +103,17 @@ func analyzeStuck(realPools map[string]map[string]bool) *StuckWorkersState {
 		if sFirst.State != "D" && !hasActiveConnection(pid, activeTCP, unixByInode) {
 			continue
 		}
-		// Фильтр: php-fpm worker из служебного пула (не относится к клиентским
-		// сайтам — типа www.conf default pool). Игнорируем, чтобы не шуметь.
+		// Фильтр: php-fpm worker из служебного пула.
+		// 1) Pool не входит в parseFPMPools этой версии (www.conf-эквивалент).
+		// 2) Pool совпадает с известным системным именем (www-data, www, apps,
+		//    apache) И не совпадает ни с одним именем сайта с панели.
 		if m := fpmPoolCmdRe.FindStringSubmatch(sFirst.Cmdline); m != nil {
 			pool := m[1]
 			ver := fpmMasters[procPPID(pid)]
 			if !isRealPool(realPools, ver, pool) {
+				continue
+			}
+			if isSystemPoolName(pool) && !siteNames[pool] {
 				continue
 			}
 		}
@@ -247,6 +253,8 @@ func readStat(pid int) (statFields, bool) {
 
 // isStuckCandidate — только web/script worker'ы.
 // Master-процессы не нужны (они тоже могут спать).
+// Проверяем по basename исполняемого файла (первое слово cmdline), а не
+// подстрокой — иначе "ihttpd" (от ISPmanager) ловится как "httpd".
 var fpmWorkerStuckRe = regexp.MustCompile(`php-fpm:\s*pool\s+`)
 
 func isStuckCandidate(cmdline string) bool {
@@ -256,10 +264,19 @@ func isStuckCandidate(cmdline string) bool {
 	if fpmWorkerStuckRe.MatchString(cmdline) {
 		return true
 	}
-	for _, k := range []string{"apache2", "httpd", "php-cgi"} {
-		if strings.Contains(cmdline, k) {
-			return true
-		}
+	// Берём первое слово cmdline — это путь к бинарю.
+	fields := strings.Fields(cmdline)
+	if len(fields) == 0 {
+		return false
+	}
+	bin := fields[0]
+	// Отрезаем путь, оставляем basename.
+	if idx := strings.LastIndex(bin, "/"); idx >= 0 {
+		bin = bin[idx+1:]
+	}
+	switch bin {
+	case "apache2", "httpd", "php-cgi":
+		return true
 	}
 	return false
 }
@@ -362,6 +379,16 @@ func wellKnownPortLabel(port int) string {
 		return "(HTTPS)"
 	}
 	return ""
+}
+
+// isSystemPoolName — имена пулов php-fpm которые обычно служебные.
+// На ISP это пул панели (www-data), на Debian/Ubuntu — дефолтный (www).
+func isSystemPoolName(pool string) bool {
+	switch pool {
+	case "www", "www-data", "apache", "apps", "default":
+		return true
+	}
+	return false
 }
 
 // isRealPool проверяет что worker'ский pool name относится к реальному сайту,

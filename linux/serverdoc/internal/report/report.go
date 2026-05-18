@@ -357,30 +357,53 @@ func renderServiceLog(p func(string, ...interface{}), name string, l *diag.Servi
 }
 
 func renderMemoryBudget(p func(string, ...interface{}), b *diag.MemoryBudget, c colors) {
-	col := c.ok
+	// Сейчас (факт из meminfo).
+	nowCol := c.ok
+	switch {
+	case b.NowUtilizationPct >= 90:
+		nowCol = c.bad
+	case b.NowUtilizationPct >= 75:
+		nowCol = c.warn
+	}
+	p("  Сейчас:               %s%d MB used · %d MB available · %d%% занято%s",
+		nowCol, b.UsedNowMB, b.AvailNowMB, b.NowUtilizationPct, c.reset)
+	if b.SwapTotalMB > 0 {
+		swapPct := 100 * b.SwapUsedMB / b.SwapTotalMB
+		swCol := c.ok
+		if swapPct >= 50 {
+			swCol = c.warn
+		}
+		if swapPct >= 90 {
+			swCol = c.bad
+		}
+		p("  Swap:                 %s%d / %d MB занято (%d%%)%s",
+			swCol, b.SwapUsedMB, b.SwapTotalMB, swapPct, c.reset)
+	}
+	p("")
+	p("  Прогноз при упоре всех воркеров в лимиты:")
+	if b.ApacheMaxMB > 0 {
+		p("    Apache @ max:       %d MB", b.ApacheMaxMB)
+	}
+	if b.FPMMaxMB > 0 {
+		p("    PHP-FPM @ max:      %d MB", b.FPMMaxMB)
+	}
+	if b.MySQLBufferMB > 0 {
+		p("    MySQL buffers:      %d MB", b.MySQLBufferMB)
+	}
+	if b.SystemBaseMB > 0 {
+		p("    Система (база):     %d MB", b.SystemBaseMB)
+	}
+	verdictCol := c.ok
 	verdict := "запас есть"
 	switch {
 	case b.UtilizationPercent >= 100:
-		col, verdict = c.bad, "не хватит RAM на пике"
+		verdictCol, verdict = c.bad, "не хватит RAM на пике"
 	case b.UtilizationPercent >= 70:
-		col, verdict = c.warn, "запас невелик"
+		verdictCol, verdict = c.warn, "запас невелик"
 	}
-	p("  Всего RAM:            %d MB", b.TotalMB)
-	if b.ApacheMaxMB > 0 {
-		p("  Apache @ max:         %d MB", b.ApacheMaxMB)
-	}
-	if b.FPMMaxMB > 0 {
-		p("  PHP-FPM @ max:        %d MB", b.FPMMaxMB)
-	}
-	if b.MySQLBufferMB > 0 {
-		p("  MySQL buffers:        %d MB", b.MySQLBufferMB)
-	}
-	if b.SystemBaseMB > 0 {
-		p("  Система (база):       %d MB", b.SystemBaseMB)
-	}
-	p("  ──────────────────────────────")
-	p("  При full load:        %s%d MB / %d MB (%d%%) — %s%s",
-		col, b.CommitMB, b.TotalMB, b.UtilizationPercent, verdict, c.reset)
+	p("    ──────────────────────────")
+	p("    Итого прогноз:      %s%d / %d MB (%d%%) — %s%s",
+		verdictCol, b.CommitMB, b.TotalMB, b.UtilizationPercent, verdict, c.reset)
 }
 
 func renderOutbound(p func(string, ...interface{}), o *diag.OutboundState, c colors) {

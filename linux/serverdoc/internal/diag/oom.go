@@ -12,10 +12,11 @@ import (
 
 // OOMState — события OOM-killer за последние 7 дней.
 type OOMState struct {
-	Source       string     `json:"source"`        // путь к файлу или "dmesg"
-	EventCount   int        `json:"event_count"`   // за 7 дней
-	RecentEvents []OOMEvent `json:"recent_events,omitempty"`
-	Note         string     `json:"note,omitempty"`
+	Source       string         `json:"source"`             // путь к файлу или "dmesg"
+	EventCount   int            `json:"event_count"`        // за 7 дней
+	ByProcess    map[string]int `json:"by_process,omitempty"` // сколько раз убит каждый процесс
+	RecentEvents []OOMEvent     `json:"recent_events,omitempty"`
+	Note         string         `json:"note,omitempty"`
 }
 
 // OOMEvent — одно событие OOM-killer.
@@ -79,12 +80,10 @@ var (
 )
 
 func parseOOM(source string, data []byte) *OOMState {
-	st := &OOMState{Source: source}
+	st := &OOMState{Source: source, ByProcess: map[string]int{}}
 	cutoff := time.Now().Add(-oomMaxAge)
 	now := time.Now()
 
-	// Строки идут в хронологическом порядке. События OOM состоят из нескольких
-	// строк, нас интересует строка с "Killed process".
 	for _, ln := range strings.Split(string(data), "\n") {
 		if !strings.Contains(ln, "Killed process") &&
 			!strings.Contains(ln, "Out of memory") &&
@@ -93,7 +92,6 @@ func parseOOM(source string, data []byte) *OOMState {
 		}
 		m := oomLineRe.FindStringSubmatch(ln)
 		if m == nil {
-			// Может быть фоновая запись "Out of memory: ..." без Killed — пропускаем.
 			continue
 		}
 		ts := parseOOMTime(ln, now)
@@ -114,9 +112,10 @@ func parseOOM(source string, data []byte) *OOMState {
 			ev.Time = ts.Format("2006-01-02 15:04:05")
 		}
 		st.RecentEvents = append(st.RecentEvents, ev)
+		st.ByProcess[m[2]]++
 		st.EventCount++
 	}
-	// Ограничим вывод последними 10 — отчёт не должен раздуваться.
+	// Ограничим вывод последними 10 — но ByProcess уже содержит ВСЕ события.
 	if len(st.RecentEvents) > 10 {
 		st.RecentEvents = st.RecentEvents[len(st.RecentEvents)-10:]
 	}

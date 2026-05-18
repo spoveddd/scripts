@@ -42,7 +42,12 @@ func main() {
 		warn = "не удалось получить список сайтов: " + err.Error()
 	}
 	st := stack.Collect()
-	d := diag.Collect(st, diag.SysAccess{MemTotalMB: info.MemTotalMB}, pk, sites, diag.Options{Quick: *quick})
+	d := diag.Collect(st, diag.SysAccess{
+		MemTotalMB:  info.MemTotalMB,
+		MemAvailMB:  info.MemAvailMB,
+		SwapTotalMB: info.SwapTotalMB,
+		SwapFreeMB:  info.SwapFreeMB,
+	}, pk, sites, diag.Options{Quick: *quick})
 
 	rep := report.Report{
 		Sys:      info,

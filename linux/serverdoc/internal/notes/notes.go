@@ -6,6 +6,7 @@ package notes
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -680,23 +681,21 @@ func oomNotes(o *diag.OOMState) []Note {
 	if o == nil || o.EventCount == 0 {
 		return nil
 	}
-	byProc := map[string]int{}
-	for _, e := range o.RecentEvents {
-		byProc[e.Process]++
-	}
+	// ByProcess содержит счёт по ВСЕМ событиям (не только показанным 10).
 	var procList []string
 	mostlyMySQL := false
-	for p, n := range byProc {
+	for p, n := range o.ByProcess {
 		if n > 1 {
 			procList = append(procList, fmt.Sprintf("%s×%d", p, n))
 		} else {
 			procList = append(procList, p)
 		}
-		// Если убивали MySQL/MariaDB — это почти всегда buffer_pool слишком велик.
 		if p == "mysqld" || p == "mariadbd" {
 			mostlyMySQL = true
 		}
 	}
+	// Сортируем чтобы вывод был стабильным.
+	sort.Strings(procList)
 	procs := strings.Join(procList, ", ")
 
 	action := []string{

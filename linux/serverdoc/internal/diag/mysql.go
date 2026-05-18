@@ -2,6 +2,7 @@ package diag
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,8 +61,10 @@ func analyzeMySQL(m *stack.Service) *MySQLState {
 	}
 	st := &MySQLState{}
 
-	// Сначала проверяем доступность: простой SELECT 1 через socket auth.
-	if _, err := mysqlQuery("SELECT 1"); err != nil {
+	// Проверяем доступность через простой SELECT 1.
+	// Пробуем три варианта по очереди (без аргументов → socket-auth root;
+	// потом известные .my.cnf файлы) — для надёжности на разных дистрибутивах.
+	if err := mysqlProbe(); err != nil {
 		st.AccessOK = false
 		st.AccessError = compactErr(err.Error())
 		return st
@@ -173,10 +176,53 @@ func mysqlVarStr(varname string) (string, bool) {
 	return "", false
 }
 
+// mysqlClientArgs — какие аргументы передавать mysql клиенту.
+// По умолчанию пусто (socket-auth от root). Если нашли работающий
+// --defaults-extra-file — используем его на все последующие команды.
+var mysqlClientArgs []string
+
+// mysqlProbe пытается подключиться разными способами. Сохраняет рабочие
+// аргументы в mysqlClientArgs чтобы все последующие SHOW использовали их.
+func mysqlProbe() error {
+	candidates := [][]string{
+		nil, // как есть, socket-auth для root
+		{"--defaults-extra-file=/root/.my.cnf"},
+		{"--defaults-file=/root/.my.cnf"},
+		{"--login-path=client"},
+	}
+	var lastErr error
+	for _, args := range candidates {
+		// Проверяем существование файла для file-варианта.
+		if len(args) > 0 && strings.Contains(args[0], "=/") {
+			path := args[0][strings.Index(args[0], "=")+1:]
+			if _, err := os.Stat(path); err != nil {
+				continue
+			}
+		}
+		mysqlClientArgs = args
+		_, err := mysqlQuery("SELECT 1")
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	mysqlClientArgs = nil
+	return lastErr
+}
+
 func mysqlQuery(sql string) (string, error) {
-	out, err := sys.Run(5*time.Second, "mysql", "-BN", "-e", sql)
+	args := append([]string{}, mysqlClientArgs...)
+	args = append(args, "-BN", "-e", sql)
+	out, err := sys.Run(5*time.Second, "mysql", args...)
 	if err != nil {
-		return out, err
+		// out обычно содержит реальное сообщение mysql client'а
+		// ("ERROR 1045: Access denied", "ERROR 2002: Can't connect to socket" и т.п.)
+		// — пробрасываем вместо безликого "exit status 1".
+		msg := strings.TrimSpace(out)
+		if msg == "" {
+			return out, err
+		}
+		return out, fmt.Errorf("%s", msg)
 	}
 	return out, nil
 }

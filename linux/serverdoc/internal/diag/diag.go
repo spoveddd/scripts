@@ -29,16 +29,23 @@ type NginxState struct {
 	Config NginxConfig `json:"config"`
 }
 
-// MemoryBudget — арифметика памяти при максимальной нагрузке.
+// MemoryBudget — арифметика памяти: фактическое потребление сейчас
+// плюс прогноз при упоре всех воркеров в лимиты.
 type MemoryBudget struct {
-	TotalMB            int `json:"total_mb"`
-	ApacheMaxMB        int `json:"apache_max_mb"`
-	FPMMaxMB           int `json:"fpm_max_mb"`
-	MySQLBufferMB      int `json:"mysql_buffer_mb"`
-	SystemBaseMB       int `json:"system_base_mb"`
-	OtherMB            int `json:"other_mb"`
-	CommitMB           int `json:"commit_mb"`
-	UtilizationPercent int `json:"utilization_percent"`
+	TotalMB             int `json:"total_mb"`
+	// Сейчас (из meminfo).
+	UsedNowMB           int `json:"used_now_mb"`
+	AvailNowMB          int `json:"avail_now_mb"`
+	SwapTotalMB         int `json:"swap_total_mb,omitempty"`
+	SwapUsedMB          int `json:"swap_used_mb,omitempty"`
+	// Прогноз при упоре в лимиты.
+	ApacheMaxMB         int `json:"apache_max_mb"`
+	FPMMaxMB            int `json:"fpm_max_mb"`
+	MySQLBufferMB       int `json:"mysql_buffer_mb"`
+	SystemBaseMB        int `json:"system_base_mb"`
+	CommitMB            int `json:"commit_mb"`
+	UtilizationPercent  int `json:"utilization_percent"`
+	NowUtilizationPct   int `json:"now_utilization_percent"`
 }
 
 // Options — флаги поведения diag.Collect.
@@ -65,7 +72,7 @@ func Collect(s stack.Stack, sysInfo SysAccess, pk panel.Kind, sites []panel.Site
 	if s.MySQL != nil {
 		r.MySQLLog = analyzeMySQLLog()
 	}
-	r.Memory = buildMemoryBudget(sysInfo.MemTotalMB, r.Apache, r.FPM, r.MySQL)
+	r.Memory = buildMemoryBudget(sysInfo, r.Apache, r.FPM, r.MySQL)
 
 	if opts.Quick {
 		r.Stuck = &StuckWorkersState{Skipped: true}
@@ -104,15 +111,27 @@ func realPools(fpm []FPMState) map[string]map[string]bool {
 // SysAccess — минимум что нужно diag из sys.Info (без импорта sys —
 // иначе циклическая зависимость в будущем).
 type SysAccess struct {
-	MemTotalMB int
+	MemTotalMB  int
+	MemAvailMB  int
+	SwapTotalMB int
+	SwapFreeMB  int
 }
 
-// buildMemoryBudget собирает арифметику памяти на максимуме нагрузки.
-func buildMemoryBudget(memTotal int, a *ApacheState, fpm []FPMState, m *MySQLState) *MemoryBudget {
-	if memTotal == 0 {
+// buildMemoryBudget собирает картину памяти: сейчас + прогноз.
+func buildMemoryBudget(s SysAccess, a *ApacheState, fpm []FPMState, m *MySQLState) *MemoryBudget {
+	if s.MemTotalMB == 0 {
 		return nil
 	}
-	b := &MemoryBudget{TotalMB: memTotal}
+	b := &MemoryBudget{
+		TotalMB:    s.MemTotalMB,
+		UsedNowMB:  s.MemTotalMB - s.MemAvailMB,
+		AvailNowMB: s.MemAvailMB,
+	}
+	if s.SwapTotalMB > 0 {
+		b.SwapTotalMB = s.SwapTotalMB
+		b.SwapUsedMB = s.SwapTotalMB - s.SwapFreeMB
+	}
+	b.NowUtilizationPct = 100 * b.UsedNowMB / s.MemTotalMB
 
 	if a != nil {
 		b.ApacheMaxMB = a.ProjectedRAMMB
@@ -123,10 +142,7 @@ func buildMemoryBudget(memTotal int, a *ApacheState, fpm []FPMState, m *MySQLSta
 	if m != nil {
 		b.MySQLBufferMB = m.Config.InnodbBufferPoolMB + m.Config.KeyBufferMB + m.Config.QueryCacheMB
 	}
-	// База ОС + сервисы (nginx, systemd, journald, cron, exim, ...).
-	// Адаптивно: ~5% RAM с границами 150..500 MB. На маленьких VPS системные
-	// сервисы реально едят меньше, на больших серверах — больше.
-	b.SystemBaseMB = memTotal * 5 / 100
+	b.SystemBaseMB = s.MemTotalMB * 5 / 100
 	if b.SystemBaseMB < 150 {
 		b.SystemBaseMB = 150
 	}
@@ -135,6 +151,6 @@ func buildMemoryBudget(memTotal int, a *ApacheState, fpm []FPMState, m *MySQLSta
 	}
 
 	b.CommitMB = b.ApacheMaxMB + b.FPMMaxMB + b.MySQLBufferMB + b.SystemBaseMB
-	b.UtilizationPercent = 100 * b.CommitMB / memTotal
+	b.UtilizationPercent = 100 * b.CommitMB / s.MemTotalMB
 	return b
 }

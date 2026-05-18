@@ -1,5 +1,5 @@
 BINARY  := serverdoc
-VERSION := 0.3.13
+VERSION := 0.3.14
 
 build:
 	go build -ldflags "-s -w -X main.version=$(VERSION)" -o $(BINARY) ./cmd/serverdoc

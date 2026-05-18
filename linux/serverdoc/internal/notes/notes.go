@@ -5,6 +5,7 @@ package notes
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -23,11 +24,12 @@ const (
 	SevInfo Severity = "info"
 )
 
-// Note — одно наблюдение.
+// Note — одно наблюдение + рекомендуемое действие.
 type Note struct {
 	Severity Severity `json:"severity"`
-	Code     string   `json:"code"` // машинный ID для будущих YAML-правил
-	Text     string   `json:"text"`
+	Code     string   `json:"code"`             // машинный ID
+	Text     string   `json:"text"`             // что увидели
+	Action   []string `json:"action,omitempty"` // что сделать (multiline)
 }
 
 // Collect строит список замечаний по снапшоту.
@@ -40,6 +42,7 @@ func Collect(s sys.Info, sites []panel.Site, st stack.Stack, d diag.Report) []No
 	out = append(out, apacheNotes(d.Apache, st.Apache, s)...)
 	out = append(out, fpmDiagNotes(d.FPM, s)...)
 	out = append(out, mysqlNotes(d.MySQL, st.MySQL, s)...)
+	out = append(out, mysqlInstancesNotes(d.MySQLInstances)...)
 	out = append(out, nginxConfigNotes(d.Nginx, d.Apache)...)
 	out = append(out, procsNotes(d.Procs)...)
 	out = append(out, serviceLogNotes("nginx", d.NginxLog)...)
@@ -324,6 +327,13 @@ func apacheNotes(a *diag.ApacheState, stk *stack.Apache, s sys.Info) []Note {
 			Text: fmt.Sprintf(
 				"Apache prefork + KeepAlive On + KeepAliveTimeout=%dс — каждый idle-клиент держит занятым целый воркер пока не разорвёт соединение. Для prefork типично 2-5с или KeepAlive Off",
 				a.Config.KeepAliveTimeout),
+			Action: []string{
+				"снизить keepalive в конфиге httpd:",
+				"    KeepAliveTimeout 3",
+				"  ИЛИ выключить полностью (nginx впереди обычно сам делает keepalive):",
+				"    KeepAlive Off",
+				"  затем: systemctl reload apache2 (или httpd)",
+			},
 		})
 	}
 
@@ -365,7 +375,6 @@ func apacheTimeoutNote(cfg diag.ApacheConfig, stk *stack.Apache) *Note {
 		return nil
 	}
 
-	// Максимум — реальная "стоимость" одного зависшего запроса.
 	worst := timeout
 	if ioTimeout > worst {
 		worst = ioTimeout
@@ -391,13 +400,32 @@ func apacheTimeoutNote(cfg diag.ApacheConfig, stk *stack.Apache) *Note {
 			worst/60)
 	}
 
+	// Конкретные команды в зависимости от ОС семейства.
+	action := []string{"снизить до 60с (Apache+fcgid) в конфиге httpd:"}
+	if dirExists("/etc/apache2") {
+		action = append(action, "  /etc/apache2/conf.d/*.conf или /etc/apache2/conf-enabled/*.conf")
+	} else if dirExists("/etc/httpd") {
+		action = append(action, "  /etc/httpd/conf.d/*.conf")
+	}
+	action = append(action,
+		"    Timeout 60",
+		"    FcgidIOTimeout 60",
+		"    FcgidBusyTimeout 90",
+		"  затем: systemctl reload apache2 (или httpd)")
+
 	return &Note{
 		Severity: SevWarn,
 		Code:     "apache_timeouts_high",
 		Text: fmt.Sprintf(
 			"Таймауты Apache/fcgid завышены (%s) — зависший backend держит воркер до %dс.%s Типично 30-60с",
 			strings.Join(parts, ", "), worst, mpmContext),
+		Action: action,
 	}
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // fcgidExtraNotes — fcgid параметры не связанные с таймаутами
@@ -416,6 +444,12 @@ func fcgidExtraNotes(cfg diag.ApacheConfig) []Note {
 			Text: fmt.Sprintf(
 				"mod_fcgid: FcgidMaxProcesses=%d — общий лимит php-cgi на весь Apache. При множестве сайтов мал — кто-то будет ждать. Дефолт 1000",
 				f.MaxProcesses),
+			Action: []string{
+				"увеличить в /etc/httpd/conf.d/fcgid.conf (или /etc/apache2/mods-enabled/fcgid.conf):",
+				"    FcgidMaxProcesses 200",
+				"    FcgidMaxProcessesPerClass 20",
+				"  затем: systemctl reload apache2 (или httpd)",
+			},
 		})
 	}
 
@@ -435,7 +469,9 @@ func fpmDiagNotes(states []diag.FPMState, s sys.Info) []Note {
 
 	totalProjectedMB := 0
 	for _, st := range states {
-		// Утилизация по пулам.
+		// Сводные счётчики по версии — чтобы не плодить десятки одинаковых нот.
+		var noTermPools, noMaxReqPools, staticHighPools []string
+
 		for _, p := range st.Pools {
 			if p.MaxChildren > 0 {
 				switch {
@@ -457,45 +493,66 @@ func fpmDiagNotes(states []diag.FPMState, s sys.Info) []Note {
 					})
 				}
 			}
-
-			// pm.max_requests=0 — нет ротации воркеров, утечки накапливаются.
 			if p.MaxRequests == 0 && p.MaxChildren > 0 {
-				out = append(out, Note{
-					Severity: SevWarn,
-					Code:     "fpm_no_max_requests",
-					Text: fmt.Sprintf(
-						"PHP %s пул %s: pm.max_requests=0 — воркеры не перезапускаются, утечки памяти накапливаются. Стандартное значение 500-1000",
-						st.Version, p.Name),
-				})
+				noMaxReqPools = append(noMaxReqPools, p.Name)
 			}
-
-			// request_terminate_timeout=0 — зависший запрос съест воркера навсегда.
 			if p.RequestTerminateTimeout == 0 && p.MaxChildren > 0 {
-				out = append(out, Note{
-					Severity: SevWarn,
-					Code:     "fpm_no_terminate_timeout",
-					Text: fmt.Sprintf(
-						"PHP %s пул %s: request_terminate_timeout не задан — зависший запрос займёт воркера до перезапуска fpm",
-						st.Version, p.Name),
-				})
+				noTermPools = append(noTermPools, p.Name)
 			}
-
-			// pm=static с большим числом воркеров — всегда жрёт память по верхнему лимиту.
 			if p.PM == "static" && p.MaxChildren >= 50 {
-				out = append(out, Note{
-					Severity: SevInfo,
-					Code:     "fpm_pm_static_high",
-					Text: fmt.Sprintf(
-						"PHP %s пул %s: pm=static с %d воркеров — память выделяется по верхнему лимиту независимо от нагрузки",
-						st.Version, p.Name, p.MaxChildren),
-				})
-			}
-
-			// Slowlog не настроен — нет видимости что замедляет сайты.
-			if p.SlowlogPath == "" || p.SlowlogTimeout == 0 {
-				// Не критично, поэтому одна общая info-нота на пул не нужна — пропускаем чтобы не шуметь.
+				staticHighPools = append(staticHighPools, p.Name)
 			}
 		}
+
+		// Сводные ноты на версию.
+		if len(noTermPools) > 0 {
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "fpm_no_terminate_timeout",
+				Text: fmt.Sprintf(
+					"PHP %s: %d пулов без request_terminate_timeout (%s) — зависший PHP-запрос занимает воркера до перезапуска fpm",
+					st.Version, len(noTermPools), summarizeList(noTermPools, 5)),
+				Action: []string{
+					"добавить в каждый pool.conf затронутых пулов:",
+					"    request_terminate_timeout = 60s",
+					"  типичные пути:",
+					"    /etc/php/X.Y/fpm/pool.d/<domain>.conf  (Debian)",
+					"    /opt/phpXY/etc/php-fpm.d/<domain>.conf (alt-php ISP/FastPanel)",
+					fmt.Sprintf("  затем: systemctl reload php%s-fpm", st.Version),
+				},
+			})
+		}
+		if len(noMaxReqPools) > 0 {
+			out = append(out, Note{
+				Severity: SevWarn,
+				Code:     "fpm_no_max_requests",
+				Text: fmt.Sprintf(
+					"PHP %s: %d пулов с pm.max_requests=0 (%s) — воркеры не перезапускаются, утечки накапливаются",
+					st.Version, len(noMaxReqPools), summarizeList(noMaxReqPools, 5)),
+				Action: []string{
+					"добавить в каждый pool.conf:",
+					"    pm.max_requests = 500",
+					fmt.Sprintf("  затем: systemctl reload php%s-fpm", st.Version),
+				},
+			})
+		}
+		if len(staticHighPools) > 0 {
+			out = append(out, Note{
+				Severity: SevInfo,
+				Code:     "fpm_pm_static_high",
+				Text: fmt.Sprintf(
+					"PHP %s: пулы pm=static с большим max_children (%s) — память выделяется по верхнему лимиту",
+					st.Version, summarizeList(staticHighPools, 5)),
+				Action: []string{
+					"если нагрузка переменная — заменить на pm=dynamic или ondemand:",
+					"    pm = dynamic",
+					"    pm.start_servers = 4",
+					"    pm.min_spare_servers = 2",
+					"    pm.max_spare_servers = 8",
+				},
+			})
+		}
+
 		totalProjectedMB += st.ProjectedRAMMB
 	}
 
@@ -553,26 +610,48 @@ func oomNotes(o *diag.OOMState) []Note {
 	if o == nil || o.EventCount == 0 {
 		return nil
 	}
-	// Сводим: какие процессы убивались чаще всего.
 	byProc := map[string]int{}
 	for _, e := range o.RecentEvents {
 		byProc[e.Process]++
 	}
 	var procList []string
+	mostlyMySQL := false
 	for p, n := range byProc {
 		if n > 1 {
 			procList = append(procList, fmt.Sprintf("%s×%d", p, n))
 		} else {
 			procList = append(procList, p)
 		}
+		// Если убивали MySQL/MariaDB — это почти всегда buffer_pool слишком велик.
+		if p == "mysqld" || p == "mariadbd" {
+			mostlyMySQL = true
+		}
 	}
 	procs := strings.Join(procList, ", ")
+
+	action := []string{
+		"посмотреть жертв подробнее:",
+		"    grep -i 'killed process' /var/log/messages /var/log/kern.log 2>/dev/null | tail -20",
+	}
+	if mostlyMySQL {
+		action = append(action,
+			"OOM убивает MySQL/MariaDB → почти всегда innodb_buffer_pool_size слишком велик.",
+			"  проверить: mysql -e \"SELECT @@innodb_buffer_pool_size/1024/1024 AS MB;\"",
+			"  снизить до 35-50% RAM в [mysqld] раздел my.cnf и рестарт mysql",
+			"  при Docker — проверить --memory лимит контейнера: docker stats")
+	}
+	action = append(action,
+		"включить vm.overcommit логи для будущих инцидентов:",
+		"    sysctl vm.panic_on_oom=0 (по умолчанию 0)",
+		"    journalctl -k --grep='oom' --since '7 days ago'")
+
 	return []Note{{
 		Severity: SevCrit,
 		Code:     "oom_recent",
 		Text: fmt.Sprintf(
 			"OOM-killer убил %d процессов за 7 дней (%s) — сервер периодически уходит в дефицит RAM",
 			o.EventCount, procs),
+		Action: action,
 	}}
 }
 
@@ -637,23 +716,35 @@ func mysqlNotes(m *diag.MySQLState, srv *stack.Service, s sys.Info) []Note {
 	// innodb_buffer_pool_size vs RAM.
 	if cfg.InnodbBufferPoolMB > 0 && s.MemTotalMB > 0 {
 		pct := 100 * cfg.InnodbBufferPoolMB / s.MemTotalMB
-		switch {
-		case pct >= 70:
-			out = append(out, Note{
-				Severity: SevCrit,
-				Code:     "mysql_buffer_pool_oversize",
-				Text: fmt.Sprintf(
-					"MySQL: innodb_buffer_pool_size=%d MB — %d%% всей RAM (%d MB). MySQL зарезервирует это под себя — на Apache/PHP останется мало",
-					cfg.InnodbBufferPoolMB, pct, s.MemTotalMB),
-			})
-		case pct >= 50:
-			out = append(out, Note{
-				Severity: SevWarn,
-				Code:     "mysql_buffer_pool_large",
-				Text: fmt.Sprintf(
-					"MySQL: innodb_buffer_pool_size=%d MB — %d%% всей RAM. Проверьте что хватает остального под Apache+PHP",
-					cfg.InnodbBufferPoolMB, pct),
-			})
+		// Рекомендованный размер: 40-50% RAM для dedicated DB, 25-35% для shared.
+		recommendedMB := s.MemTotalMB * 35 / 100
+		if pct >= 50 {
+			act := []string{
+				fmt.Sprintf("снизить до ~%d MB (35%% RAM):", recommendedMB),
+				"  в /etc/mysql/my.cnf или /etc/my.cnf раздел [mysqld]:",
+				fmt.Sprintf("    innodb_buffer_pool_size = %dM", recommendedMB),
+				"  затем: systemctl restart mysql (или mysqld/mariadb)",
+				"  ВНИМАНИЕ: restart MySQL — короткий downtime, делать в окно",
+			}
+			if pct >= 70 {
+				out = append(out, Note{
+					Severity: SevCrit,
+					Code:     "mysql_buffer_pool_oversize",
+					Text: fmt.Sprintf(
+						"MySQL: innodb_buffer_pool_size=%d MB — %d%% всей RAM (%d MB). MySQL зарезервирует это под себя, на Apache/PHP останется мало → риск OOM",
+						cfg.InnodbBufferPoolMB, pct, s.MemTotalMB),
+					Action: act,
+				})
+			} else {
+				out = append(out, Note{
+					Severity: SevWarn,
+					Code:     "mysql_buffer_pool_large",
+					Text: fmt.Sprintf(
+						"MySQL: innodb_buffer_pool_size=%d MB — %d%% всей RAM",
+						cfg.InnodbBufferPoolMB, pct),
+					Action: act,
+				})
+			}
 		}
 	}
 
@@ -683,11 +774,62 @@ func mysqlNotes(m *diag.MySQLState, srv *stack.Service, s sys.Info) []Note {
 		out = append(out, Note{
 			Severity: SevInfo,
 			Code:     "mysql_slow_query_disabled",
-			Text:     "MySQL: slow_query_log=OFF — нет видимости что замедляет БД. Включить и поставить long_query_time=1-3",
+			Text:     "MySQL: slow_query_log=OFF — нет видимости что замедляет БД",
+			Action: []string{
+				"включить runtime (без рестарта):",
+				"  mysql -e \"SET GLOBAL slow_query_log=ON; SET GLOBAL long_query_time=2;\"",
+				"для постоянной фиксации добавьте в [mysqld] my.cnf:",
+				"    slow_query_log = 1",
+				"    slow_query_log_file = /var/log/mysql/slow.log",
+				"    long_query_time = 2",
+			},
 		})
 	}
 
 	return out
+}
+
+// mysqlInstancesNotes — ноты про множественные MySQL инстансы.
+// Часто корень "не понимаю откуда столько RAM" — два mysqld из разных
+// источников (системный + Docker).
+func mysqlInstancesNotes(instances []diag.MySQLInstance) []Note {
+	if len(instances) <= 1 {
+		return nil
+	}
+	containerized, native := 0, 0
+	totalMB := 0
+	for _, inst := range instances {
+		if inst.Containerized {
+			containerized++
+		} else {
+			native++
+		}
+		totalMB += inst.RSSMB
+	}
+	desc := fmt.Sprintf("найдено %d инстансов MySQL/MariaDB (нативных %d, в контейнерах %d) суммарно ~%d MB RSS",
+		len(instances), native, containerized, totalMB)
+
+	action := []string{
+		"проверить какие инстансы реально нужны:",
+		"    ps auxf | grep -E 'mysqld|mariadbd'",
+		"    docker ps --filter ancestor=mysql --filter ancestor=mariadb",
+	}
+	if containerized > 0 {
+		action = append(action,
+			"для Docker-инстансов проверить лимиты памяти:",
+			"    docker inspect <container> | grep -i memory")
+	}
+	if native > 0 && containerized > 0 {
+		action = append(action,
+			"если один из них — артефакт (старая инсталляция или забытый контейнер):",
+			"    остановить ненужный — освободится RAM")
+	}
+	return []Note{{
+		Severity: SevWarn,
+		Code:     "mysql_multiple_instances",
+		Text:     desc,
+		Action:   action,
+	}}
 }
 
 // mysqlQueryCacheNote возвращает ноту про query_cache_size с учётом движка
@@ -885,9 +1027,29 @@ func dash(s string) string {
 	return s
 }
 
+// summarizeList возвращает строку "a, b, c +N ещё" если список длиннее limit,
+// иначе просто "a, b, c". Чтобы длинные ноты с десятками pool name не раздували
+// отчёт.
+func summarizeList(items []string, limit int) string {
+	if len(items) <= limit {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:limit], ", ") + fmt.Sprintf(", +%d ещё", len(items)-limit)
+}
+
 func memoryBudgetNotes(b *diag.MemoryBudget) []Note {
 	if b == nil || b.CommitMB == 0 {
 		return nil
+	}
+	// Action общая для обоих severity — но в crit сильнее.
+	mkAction := func() []string {
+		return []string{
+			"возможные шаги (по убыванию обычной эффективности):",
+			fmt.Sprintf("  1) MySQL buffer_pool ~ %d MB → уменьшить если >35%% RAM (см. ноту mysql_buffer_pool)", b.MySQLBufferMB),
+			fmt.Sprintf("  2) Apache MaxRequestWorkers (сейчас даёт ~%d MB) → снизить лимит", b.ApacheMaxMB),
+			"  3) PHP-FPM pm.max_children на тяжёлых пулах → снизить",
+			"  4) docker stats — проверить лимиты памяти контейнеров",
+		}
 	}
 	switch {
 	case b.UtilizationPercent >= 100:
@@ -895,8 +1057,9 @@ func memoryBudgetNotes(b *diag.MemoryBudget) []Note {
 			Severity: SevCrit,
 			Code:     "memory_budget_overflow",
 			Text: fmt.Sprintf(
-				"Бюджет памяти при max нагрузке: %d MB при RAM %d MB (%d%%) — RAM не хватит на пике",
+				"Бюджет памяти при max нагрузке: %d MB при RAM %d MB (%d%%) — RAM не хватит на пике, риск OOM",
 				b.CommitMB, b.TotalMB, b.UtilizationPercent),
+			Action: mkAction(),
 		}}
 	case b.UtilizationPercent >= 70:
 		return []Note{{
@@ -905,6 +1068,7 @@ func memoryBudgetNotes(b *diag.MemoryBudget) []Note {
 			Text: fmt.Sprintf(
 				"Бюджет памяти при max нагрузке: %d MB при RAM %d MB (%d%%) — запас по памяти невелик",
 				b.CommitMB, b.TotalMB, b.UtilizationPercent),
+			Action: mkAction(),
 		}}
 	}
 	return nil

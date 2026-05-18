@@ -1,11 +1,9 @@
 BINARY  := serverdoc
-VERSION := 0.3.10
+VERSION := 0.3.12
 
-# Локальная сборка под текущую систему
 build:
 	go build -ldflags "-s -w -X main.version=$(VERSION)" -o $(BINARY) ./cmd/serverdoc
 
-# Кросс-компиляция статичных бинарников под Linux (заливаются в Releases)
 build-all:
 	mkdir -p dist
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=$(VERSION)" -o dist/$(BINARY)-linux-amd64 ./cmd/serverdoc

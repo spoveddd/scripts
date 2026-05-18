@@ -9,18 +9,19 @@ import (
 
 // Report — общий снимок динамики.
 type Report struct {
-	Apache   *ApacheState       `json:"apache,omitempty"`
-	Nginx    *NginxState        `json:"nginx,omitempty"`
-	FPM      []FPMState         `json:"fpm,omitempty"`
-	MySQL    *MySQLState        `json:"mysql,omitempty"`
-	Procs    *ProcsState        `json:"procs,omitempty"`
-	Logs     *LogsState         `json:"logs,omitempty"`
-	NginxLog *ServiceLogState   `json:"nginx_log,omitempty"`
-	MySQLLog *ServiceLogState   `json:"mysql_log,omitempty"`
-	OOM      *OOMState          `json:"oom,omitempty"`
-	Memory   *MemoryBudget      `json:"memory,omitempty"`
-	Outbound *OutboundState     `json:"outbound,omitempty"`
-	Stuck    *StuckWorkersState `json:"stuck,omitempty"`
+	Apache         *ApacheState       `json:"apache,omitempty"`
+	Nginx          *NginxState        `json:"nginx,omitempty"`
+	FPM            []FPMState         `json:"fpm,omitempty"`
+	MySQL          *MySQLState        `json:"mysql,omitempty"`
+	MySQLInstances []MySQLInstance    `json:"mysql_instances,omitempty"`
+	Procs          *ProcsState        `json:"procs,omitempty"`
+	Logs           *LogsState         `json:"logs,omitempty"`
+	NginxLog       *ServiceLogState   `json:"nginx_log,omitempty"`
+	MySQLLog       *ServiceLogState   `json:"mysql_log,omitempty"`
+	OOM            *OOMState          `json:"oom,omitempty"`
+	Memory         *MemoryBudget      `json:"memory,omitempty"`
+	Outbound       *OutboundState     `json:"outbound,omitempty"`
+	Stuck          *StuckWorkersState `json:"stuck,omitempty"`
 }
 
 // NginxState — конфигурация nginx.
@@ -48,13 +49,14 @@ type Options struct {
 // Collect собирает полный снимок динамики.
 func Collect(s stack.Stack, sysInfo SysAccess, pk panel.Kind, sites []panel.Site, opts Options) Report {
 	r := Report{
-		Apache:   analyzeApache(s.Apache),
-		FPM:      analyzeFPM(s.PHP),
-		MySQL:    analyzeMySQL(s.MySQL),
-		Procs:    analyzeProcs(),
-		Logs:     analyzeLogs(pk, sites),
-		OOM:      analyzeOOM(),
-		Outbound: analyzeOutbound(),
+		Apache:         analyzeApache(s.Apache),
+		FPM:            analyzeFPM(s.PHP),
+		MySQL:          analyzeMySQL(s.MySQL),
+		MySQLInstances: findMySQLInstances(),
+		Procs:          analyzeProcs(),
+		Logs:           analyzeLogs(pk, sites),
+		OOM:            analyzeOOM(),
+		Outbound:       analyzeOutbound(),
 	}
 	if s.Nginx != nil {
 		r.NginxLog = analyzeNginxLog()

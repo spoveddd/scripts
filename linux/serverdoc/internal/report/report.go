@@ -124,7 +124,7 @@ func (r Report) Text(w io.Writer, color bool) {
 		renderApacheDiag(p, r.Diag.Apache, r.Stack.Apache, c)
 		renderNginxDiag(p, r.Diag.Nginx, c)
 		renderFPMDiag(p, r.Diag.FPM, c)
-		renderMySQLDiag(p, r.Diag.MySQL, c)
+		renderMySQLDiag(p, r.Diag.MySQL, r.Diag.MySQLInstances, c)
 		renderProcsDiag(p, r.Diag.Procs, c)
 		renderLogsDiag(p, r.Diag.Logs, c)
 	}
@@ -169,11 +169,10 @@ func (r Report) Text(w io.Writer, color bool) {
 	if len(r.Notes) > 0 {
 		p("")
 		p("%sЗАМЕЧАНИЯ%s", c.head, c.reset)
-		// Wrap длинных текстов по ширине отчёта. Первая строка: "  X TEXT",
-		// продолжение: "    TEXT" (отступ как у текста).
 		const wrapWidth = reportWidth - 4 // - "  X " (4 руны)
 		for _, n := range orderNotes(r.Notes) {
 			marker, col := severityMarker(n.Severity, c)
+			// Текст ноты — с word-wrap.
 			lines := wrapText(n.Text, wrapWidth)
 			for i, ln := range lines {
 				if i == 0 {
@@ -181,6 +180,15 @@ func (r Report) Text(w io.Writer, color bool) {
 				} else {
 					p("    %s%s%s", col, ln, c.reset)
 				}
+			}
+			// Рекомендации — другим цветом и с маркером "→".
+			for j, act := range n.Action {
+				prefix := "    → "
+				if j > 0 {
+					prefix = "      "
+				}
+				// Action может содержать многострочные блоки конфига — wrap не применяем.
+				p("%s%s%s%s", prefix, c.dim, act, c.reset)
 			}
 		}
 	}
@@ -639,9 +647,24 @@ func renderFPMDiag(p func(string, ...interface{}), states []diag.FPMState, c col
 	}
 }
 
-func renderMySQLDiag(p func(string, ...interface{}), m *diag.MySQLState, c colors) {
+func renderMySQLDiag(p func(string, ...interface{}), m *diag.MySQLState, instances []diag.MySQLInstance, c colors) {
 	if m == nil {
 		return
+	}
+	// Список инстансов: если их >1, показываем явно — это часто Docker+native.
+	if len(instances) > 1 {
+		p("  MySQL инстансы: %d (mysql client отвечает на один)", len(instances))
+		for _, inst := range instances {
+			label := "native"
+			if inst.Containerized {
+				label = inst.CgroupHint
+				if label == "" {
+					label = "containerized"
+				}
+			}
+			p("           PID %d %s · RSS %d MB · %s",
+				inst.PID, inst.Name, inst.RSSMB, label)
+		}
 	}
 	if !m.AccessOK {
 		p("  MySQL:   %sнет доступа: %s%s", c.warn, m.AccessError, c.reset)

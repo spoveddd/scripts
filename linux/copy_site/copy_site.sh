@@ -1,6 +1,6 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  Site Copy Script v4.0                                       ║
+# ║  Site Copy Script v4.1                                       ║
 # ║  Поддержка: FastPanel · ISPManager · Hestia                  ║
 # ║  Автор: Vladislav Pavlovich  |  Telegram: @sysadminctl       ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -135,7 +135,7 @@ show_header() {
     local line="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     printf "\n"
     printf "  ${BOLD}${GREEN}%s${NC}\n" "$line"
-    printf "  ${BOLD}${WHITE}  copy_site.sh v4.0${NC} — инструмент удобного копирования сайтов\n"
+    printf "  ${BOLD}${WHITE}  copy_site.sh v4.1${NC} — инструмент удобного копирования сайтов\n"
     printf "  ${CYAN}  FastPanel · ISPManager · Hestia  |  Vladislav Pavlovich · @sysadminctl${NC}\n"
     printf "  ${BOLD}${GREEN}%s${NC}\n" "$line"
     printf "\n"
@@ -801,9 +801,9 @@ get_db_info_from_dle_config() {
     local f="$1"
     [[ -f "$f" ]] || return 1
     local n u p
-    n=$(grep 'DBNAME' "$f" | sed 's/.*["\x27]\([^"\x27]*\)["\x27].*/\1/' | head -1)
-    u=$(grep 'DBUSER' "$f" | sed 's/.*["\x27]\([^"\x27]*\)["\x27].*/\1/' | head -1)
-    p=$(grep 'DBPASS' "$f" | sed 's/.*["\x27]\([^"\x27]*\)["\x27].*/\1/' | head -1)
+    n=$(php_define_get "$f" "DBNAME")
+    u=$(php_define_get "$f" "DBUSER")
+    p=$(php_define_get "$f" "DBPASS")
     echo "$n|$u|$p"
 }
 
@@ -832,6 +832,26 @@ get_db_info_from_opencart_config() {
 # БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════
 
+# Убирает DEFINER=`старый_юзер`@`localhost` из дампа.
+# Иначе триггеры/процедуры/представления копируются вместе с владельцем исходного
+# сайта, и MySQL при их срабатывании проверяет права ЭТОГО пользователя на новой БД:
+#   ERROR 1142: TRIGGER command denied to user 'old_usr'@'localhost' for table 'dle_post'
+# Без DEFINER владельцем становится тот, кто импортирует дамп (root).
+sanitize_dump_definers() {
+    local dump="$1"
+    [[ -f "$dump" ]] || return 0
+    grep -q 'DEFINER=' "$dump" 2>/dev/null || return 0
+
+    # Правим ТОЛЬКО строки определений (/*!... и CREATE ...), чтобы не задеть
+    # данные: строка «DEFINER=`x`@`y`» вполне может лежать внутри INSERT
+    # (статья про MySQL, сохранённый дамп в поле и т.п.)
+    sed -i -E '\%^(/\*!|CREATE )%{
+        s/DEFINER=`[^`]*`@`[^`]*`[[:space:]]*//g
+        s/SQL SECURITY DEFINER/SQL SECURITY INVOKER/g
+    }' "$dump"
+    log_info "Из дампа удалены DEFINER (триггеры/процедуры/представления/события)"
+}
+
 create_db_dump() {
     local db="$1"
     local dump="/tmp/${db}_$(date +%Y%m%d_%H%M%S).sql"
@@ -842,6 +862,7 @@ create_db_dump() {
     log_info "Создаю дамп БД $db..."
     if mysqldump --routines --triggers --events --single-transaction "$db" > "$dump" 2>>"$LOG_FILE"; then
         if [[ -s "$dump" ]]; then
+            sanitize_dump_definers "$dump"
             log_success "Дамп создан: $dump ($(du -h "$dump" | cut -f1))"
             echo "$dump"
         else
@@ -870,26 +891,117 @@ import_db_dump() {
         log_error "Ошибка импорта дампа!"
         return 1
     fi
+
+    check_foreign_definers "$db"
+}
+
+# Предупреждает, если в новой БД остались триггеры/процедуры от чужого пользователя
+check_foreign_definers() {
+    local db="$1"
+    local me foreign
+    me=$(mysql -Nse "SELECT CURRENT_USER();" 2>/dev/null) || return 0
+    me="${me%%@*}"
+
+    foreign=$(mysql -Nse "
+        SELECT CONCAT('TRIGGER ', trigger_name, ' -> ', definer)
+          FROM information_schema.triggers
+         WHERE trigger_schema = '$db' AND definer NOT LIKE '${me}@%'
+        UNION ALL
+        SELECT CONCAT(routine_type, ' ', routine_name, ' -> ', definer)
+          FROM information_schema.routines
+         WHERE routine_schema = '$db' AND definer NOT LIKE '${me}@%'
+        UNION ALL
+        SELECT CONCAT('EVENT ', event_name, ' -> ', definer)
+          FROM information_schema.events
+         WHERE event_schema = '$db' AND definer NOT LIKE '${me}@%'
+        UNION ALL
+        SELECT CONCAT('VIEW ', table_name, ' -> ', definer, ' (', security_type, ')')
+          FROM information_schema.views
+         WHERE table_schema = '$db' AND definer NOT LIKE '${me}@%'
+               AND security_type = 'DEFINER'
+    " 2>/dev/null) || return 0
+
+    if [[ -n "$foreign" ]]; then
+        log_warning "В БД $db остались объекты со сторонним DEFINER — сайт может получить ошибку 1142:"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && printf "      ${DIM}%s${NC}\n" "$line"
+        done <<< "$foreign"
+    fi
+}
+
+# Проверяет, что CMS реально сможет подключиться к БД с этими данными
+verify_db_credentials() {
+    local db="$1" user="$2" pass="$3"
+    $DRY_RUN && return 0
+    [[ -n "$db" && -n "$user" ]] || return 0
+
+    if mysql --user="$user" --password="$pass" --host=localhost "$db" \
+             -e "SELECT 1;" &>/dev/null; then
+        log_success "Подключение к БД от имени $user проверено"
+        return 0
+    fi
+
+    log_error "Не удалось подключиться к БД $db от имени $user с записанным в конфиг паролем!"
+    log_error "Проверьте конфиг CMS и права пользователя БД."
+    return 1
 }
 
 # ═══════════════════════════════════════════════════════════════
 # ОБНОВЛЕНИЕ КОНФИГУРАЦИОННЫХ ФАЙЛОВ CMS
 # ═══════════════════════════════════════════════════════════════
 
+# Заменяет значение define('KEY', '...') / define("KEY", "...") в PHP-конфиге.
+# Кавычки ключа и значения могут быть любыми и разными: реальные конфиги DLE
+# встречаются в виде  define ("DBPASS", 'pass');  — старые sed-шаблоны с жёстко
+# заданными кавычками такую строку молча не находили, и пароль оставался старым.
+php_squote_escape() {
+    printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g"
+}
+
+php_define_set() {
+    local file="$1" key="$2" val="$3"
+    local php_val sed_val
+    # экранируем для PHP-строки в одинарных кавычках
+    php_val=$(php_squote_escape "$val")
+    # экранируем спецсимволы правой части sed (& \ и разделитель |)
+    sed_val=$(printf '%s' "$php_val" | sed 's/[\\&|]/\\&/g')
+
+    sed -i -E "s|(define[[:space:]]*\([[:space:]]*[\"']${key}[\"'][[:space:]]*,[[:space:]]*)[\"'][^\"']*[\"']|\1'${sed_val}'|" "$file"
+}
+
+php_define_get() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    sed -nE "s|.*define[[:space:]]*\([[:space:]]*[\"']${key}[\"'][[:space:]]*,[[:space:]]*[\"']([^\"']*)[\"'].*|\1|p" "$file" | head -1
+}
+
+# Сверяет записанное значение с ожидаемым — чтобы «обновлён» в логе
+# не означало, что sed молча ничего не заменил
+php_define_verify() {
+    local file="$1" key="$2" expected="$3" actual
+    expected=$(php_squote_escape "$expected")
+    actual=$(php_define_get "$file" "$key")
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "В $file не удалось заменить $key (осталось: '${actual}')"
+        return 1
+    fi
+    return 0
+}
+
 update_wp_config() {
     local cfg="$1" db="$2" user="$3" pass="$4"
     [[ -f "$cfg" ]] || { log_error "wp-config.php не найден: $cfg"; return 1; }
 
     cp "$cfg" "${cfg}.bak"
-    local tmp="${cfg}.tmp"
-    cp "$cfg" "$tmp"
+    php_define_set "$cfg" "DB_NAME"     "$db"
+    php_define_set "$cfg" "DB_USER"     "$user"
+    php_define_set "$cfg" "DB_PASSWORD" "$pass"
 
-    # Универсальный regex: обрабатывает одинарные и двойные кавычки, пробелы
-    sed -i "s|define[[:space:]]*([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"])|define( 'DB_NAME', '$db' )|" "$tmp"
-    sed -i "s|define[[:space:]]*([[:space:]]*['\"]DB_USER['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"])|define( 'DB_USER', '$user' )|" "$tmp"
-    sed -i "s|define[[:space:]]*([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"])|define( 'DB_PASSWORD', '$pass' )|" "$tmp"
-
-    mv "$tmp" "$cfg"
+    local rc=0
+    php_define_verify "$cfg" "DB_NAME"     "$db"   || rc=1
+    php_define_verify "$cfg" "DB_USER"     "$user" || rc=1
+    php_define_verify "$cfg" "DB_PASSWORD" "$pass" || rc=1
+    [[ $rc -eq 0 ]] || return 1
     log_success "wp-config.php обновлён"
 }
 
@@ -954,17 +1066,19 @@ update_dle_config() {
     local path="$1" db="$2" user="$3" pass="$4" url="$5"
     local dbcfg="$path/engine/data/dbconfig.php"
     local cfg="$path/engine/data/config.php"
-    local escaped_pass
-    escaped_pass=$(printf '%s\n' "$pass" | sed 's/[\/&]/\\&/g')
 
     if [[ -f "$dbcfg" ]]; then
         cp "$dbcfg" "${dbcfg}.bak"
-        sed -i "s/define (\"DBNAME\", \"[^\"]*\")/define (\"DBNAME\", \"$db\")/" "$dbcfg"
-        sed -i "s/define (\"DBUSER\", \"[^\"]*\")/define (\"DBUSER\", \"$user\")/" "$dbcfg"
-        sed -i "s/define (\"DBPASS\", \"[^\"]*\")/define (\"DBPASS\", \"$escaped_pass\")/" "$dbcfg"
-        sed -i "s/define ('DBNAME', '[^']*')/define ('DBNAME', '$db')/" "$dbcfg"
-        sed -i "s/define ('DBUSER', '[^']*')/define ('DBUSER', '$user')/" "$dbcfg"
-        sed -i "s/define ('DBPASS', '[^']*')/define ('DBPASS', '$escaped_pass')/" "$dbcfg"
+        php_define_set "$dbcfg" "DBNAME" "$db"
+        php_define_set "$dbcfg" "DBUSER" "$user"
+        php_define_set "$dbcfg" "DBPASS" "$pass"
+
+        # Проверяем, что значения действительно записались
+        local rc=0
+        php_define_verify "$dbcfg" "DBNAME" "$db"   || rc=1
+        php_define_verify "$dbcfg" "DBUSER" "$user" || rc=1
+        php_define_verify "$dbcfg" "DBPASS" "$pass" || rc=1
+        [[ $rc -eq 0 ]] || return 1
         log_success "DLE dbconfig.php обновлён"
     else
         log_error "Файл DLE dbconfig.php не найден: $dbcfg"
@@ -973,8 +1087,9 @@ update_dle_config() {
 
     if [[ -f "$cfg" ]]; then
         cp "$cfg" "${cfg}.bak"
-        sed -i "s|'http_home_url' => '[^']*'|'http_home_url' => 'https://$url'|" "$cfg"
-        log_success "DLE config.php обновлён (URL → https://$url)"
+        # DLE хранит http_home_url со слешем на конце
+        sed -i "s|'http_home_url'[[:space:]]*=>[[:space:]]*'[^']*'|'http_home_url' => 'https://$url/'|" "$cfg"
+        log_success "DLE config.php обновлён (URL → https://$url/)"
     fi
 }
 
@@ -996,15 +1111,13 @@ update_joomla_config() {
 
 update_opencart_config() {
     local path="$1" db="$2" user="$3" pass="$4" url="$5"
-    local escaped_pass
-    escaped_pass=$(printf '%s\n' "$pass" | sed 's/[\/&]/\\&/g')
 
     for cfg in "$path/config.php" "$path/admin/config.php"; do
         [[ -f "$cfg" ]] || continue
         cp "$cfg" "${cfg}.bak"
-        sed -i "s|define('DB_DATABASE', '[^']*')|define('DB_DATABASE', '$db')|" "$cfg"
-        sed -i "s|define('DB_USERNAME', '[^']*')|define('DB_USERNAME', '$user')|" "$cfg"
-        sed -i "s|define('DB_PASSWORD', '[^']*')|define('DB_PASSWORD', '$escaped_pass')|" "$cfg"
+        php_define_set "$cfg" "DB_DATABASE" "$db"
+        php_define_set "$cfg" "DB_USERNAME" "$user"
+        php_define_set "$cfg" "DB_PASSWORD" "$pass"
         sed -i "s|define('HTTP_SERVER', '[^']*')|define('HTTP_SERVER', 'https://$url/')|" "$cfg"
         sed -i "s|define('HTTPS_SERVER', '[^']*')|define('HTTPS_SERVER', 'https://$url/')|" "$cfg"
         log_success "OpenCart $(basename "$cfg") обновлён"
@@ -1729,28 +1842,42 @@ copy_site() {
             return 1
         }
 
-        # Обновление конфигов CMS
+        # Обновление конфигов CMS.
+        # Ошибку правки конфига не считаем фатальной (сайт и БД уже созданы),
+        # но громко сообщаем — иначе set -e оборвёт скрипт до итогового отчёта
+        local cfg_ok=true
         case $cms in
             wordpress)
                 update_wp_config "$new_site_path/wp-config.php" \
-                    "$actual_db_name" "$actual_db_user" "$new_db_pass"
+                    "$actual_db_name" "$actual_db_user" "$new_db_pass" || cfg_ok=false
                 update_wp_urls_in_db "$actual_db_name" "$source_site" "$new_site" "$wp_prefix"
                 update_wordpress_domains "$new_site_path" "$source_site" "$new_site" "$php_bin"
                 ;;
             dle)
                 update_dle_config "$new_site_path" \
-                    "$actual_db_name" "$actual_db_user" "$new_db_pass" "$new_site"
+                    "$actual_db_name" "$actual_db_user" "$new_db_pass" "$new_site" || cfg_ok=false
                 ;;
             joomla)
                 update_joomla_config "$new_site_path" \
-                    "$actual_db_name" "$actual_db_user" "$new_db_pass" "$new_site"
+                    "$actual_db_name" "$actual_db_user" "$new_db_pass" "$new_site" || cfg_ok=false
                 ;;
             opencart)
                 update_opencart_config "$new_site_path" \
-                    "$actual_db_name" "$actual_db_user" "$new_db_pass" "$new_site"
+                    "$actual_db_name" "$actual_db_user" "$new_db_pass" "$new_site" || cfg_ok=false
                 ;;
         esac
-        log_success "Конфигурация CMS обновлена"
+
+        # Проверяем, что CMS действительно сможет войти в БД
+        if [[ "$cms" != "other" ]]; then
+            verify_db_credentials "$actual_db_name" "$actual_db_user" "$new_db_pass" || cfg_ok=false
+        fi
+
+        if $cfg_ok; then
+            log_success "Конфигурация CMS обновлена"
+        else
+            log_warning "Конфиг CMS обновлён не полностью — впишите данные БД вручную,"
+            log_warning "иначе сайт отдаст 'Access denied for user'"
+        fi
     fi
 
     # ──────────────────────────────────────────────────────────

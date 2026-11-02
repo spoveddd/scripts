@@ -11,19 +11,19 @@
 Проверка:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/cve-2026-98432/cve98432-check.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/cve_2026_98432/cve98432-check.sh)
 ```
 
 Поставить защиту (root):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/cve-2026-98432/cve98432-block.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/cve_2026_98432/cve98432-block.sh)
 ```
 
 Снять защиту (после перезагрузки на исправленное ядро):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/cve-2026-98432/cve98432-block.sh) --undo
+bash <(curl -fsSL https://raw.githubusercontent.com/spoveddd/scripts/main/linux/cve_2026_98432/cve98432-block.sh) --undo
 ```
 
 ## cve98432-check.sh — проверка
